@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QWidget
+
+
+SCREEN_OBSERVATION_TRIGGER_KEYWORDS = (
+    "看屏幕",
+    "观察屏幕",
+    "看看屏幕",
+    "看看当前画面",
+    "帮我看这个",
+)
+SCREEN_OBSERVATION_HISTORY_MARKER = "[已附加当前屏幕截图，仅用于本轮请求]"
+SCREEN_OBSERVATION_MAX_EDGE = 1280
+SCREEN_OBSERVATION_JPEG_QUALITY = 70
+
+
+@dataclass(frozen=True)
+class ScreenObservation:
+    """一次按需屏幕观察结果，不负责持久化截图内容。"""
+
+    data_url: str
+    width: int
+    height: int
+    captured_at: str
+    screen_name: str
+
+
+def should_observe_screen(text: str) -> bool:
+    """判断用户是否明确要求观察屏幕。"""
+    normalized = "".join(text.split()).lower()
+    return any(keyword in normalized for keyword in SCREEN_OBSERVATION_TRIGGER_KEYWORDS)
+
+
+def append_observation_marker(text: str, observation: ScreenObservation) -> str:
+    """给历史记录追加观察标记，避免保存 base64 图片。"""
+    _ = observation
+    return f"{text.rstrip()}\n{SCREEN_OBSERVATION_HISTORY_MARKER}"
+
+
+def build_screen_observation_user_message(
+    text: str,
+    observation: ScreenObservation,
+) -> dict[str, object]:
+    """构造 OpenAI 兼容的多模态用户消息。"""
+    prompt_text = (
+        f"{text.strip()}\n\n"
+        f"当前屏幕截图信息：{observation.width}x{observation.height}，"
+        f"捕获时间 {observation.captured_at}，屏幕 {observation.screen_name}。"
+    ).strip()
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": prompt_text,
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": observation.data_url,
+                    "detail": "low",
+                },
+            },
+        ],
+    }
+
+
+def capture_screen_observation(excluded_widget: QWidget | None = None) -> ScreenObservation:
+    """截取光标所在屏幕；可临时隐藏桌宠窗口，避免它挡住画面。"""
+    from PySide6.QtGui import QCursor
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("屏幕观察需要先创建 QApplication。")
+
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    if screen is None:
+        raise RuntimeError("无法找到可截图的屏幕。")
+
+    should_restore = bool(excluded_widget is not None and excluded_widget.isVisible())
+    if should_restore and excluded_widget is not None:
+        excluded_widget.hide()
+        QApplication.processEvents()
+
+    try:
+        pixmap = screen.grabWindow(0)
+    finally:
+        if should_restore and excluded_widget is not None:
+            excluded_widget.show()
+            excluded_widget.raise_()
+            QApplication.processEvents()
+
+    if pixmap.isNull():
+        raise RuntimeError("屏幕截图为空，可能被系统权限或显示环境阻止。")
+
+    encoded_pixmap = _scaled_pixmap(pixmap)
+    return ScreenObservation(
+        data_url=_encode_pixmap_to_data_url(encoded_pixmap),
+        width=encoded_pixmap.width(),
+        height=encoded_pixmap.height(),
+        captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        screen_name=screen.name() or "primary",
+    )
+
+
+def _scaled_pixmap(pixmap: QPixmap) -> QPixmap:
+    from PySide6.QtCore import Qt
+
+    longest_edge = max(pixmap.width(), pixmap.height())
+    if longest_edge <= SCREEN_OBSERVATION_MAX_EDGE:
+        return pixmap
+    return pixmap.scaled(
+        SCREEN_OBSERVATION_MAX_EDGE,
+        SCREEN_OBSERVATION_MAX_EDGE,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def _encode_pixmap_to_data_url(pixmap: QPixmap) -> str:
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not pixmap.toImage().save(buffer, "JPEG", SCREEN_OBSERVATION_JPEG_QUALITY):
+        raise RuntimeError("屏幕截图编码失败。")
+    image_bytes = bytes(buffer.data())
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"

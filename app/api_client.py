@@ -17,6 +17,7 @@ from app.env_config import load_env_file, save_env_values
 
 MAX_API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 0.8
+ChatMessage = dict[str, Any]
 
 SEGMENTED_REPLY_INSTRUCTION_TEMPLATE = """
 你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
@@ -24,12 +25,14 @@ JSON 格式如下：
 {"segments":[{"ja":"日文原文","zh":"中文译文","tone":"中性"}]}
 
 分段规则：
-- 尽量输出 2-4 段文本，每段是一条可以单独显示的完整小消息，不要把一句话机械切碎。
+- 尽量输出 3-4 段文本，每段是一条可以单独显示的完整小消息，不要把一句话机械切碎。
 - 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。
-- 如果用户只问很简单的问题，可以只输出 1-2 段。
+- 如果用户只问很简单的问题，可以只输出 2-3 段。
 - 需要对每段文本的语气进行标注，语气标签放在 tone 字段中。
 - tone 只能从这些类别中选择：{tones}。
 - ja 中只写夜乃桜要说出口的日文原文，必须是日语，适合直接交给日语 TTS 朗读。
+- ja 中不要有任何非日语内容，如果出现例如中文引用, 把引用的中文内容翻译成日文放在 ja 字段里；
+- ja 中不要有英文单词，如果日文中夹杂着英文名词之类的，请使用片假名的拼写来替换原英文单词。
 - zh 中只写 ja 对应的自然中文译文，必须是中文，不要添加解释、括号动作、语气标签或额外内容。
 - 无论用户使用什么语言，ja 和 zh 都必须同时输出；不要只输出其中一种语言。
 - ja 和 zh 必须一一对应；不要为了翻译改变 ja 的角色语气或内容。
@@ -142,7 +145,7 @@ class OpenAICompatibleClient:
     def chat(
         self,
         system_prompt: str,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         reply_tones: list[str] | None = None,
     ) -> ChatReply:
         segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones)
@@ -157,7 +160,7 @@ class OpenAICompatibleClient:
     def complete_raw(
         self,
         system_prompt: str,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         temperature: float = 0.8,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
@@ -251,4 +254,34 @@ def _build_segmented_reply_instruction(reply_tones: list[str] | None) -> str:
     if not tones:
         tones = ["开心", "中性", "温柔", "甜蜜", "害羞"]
     return SEGMENTED_REPLY_INSTRUCTION_TEMPLATE.strip().replace("{tones}", "、".join(tones))
+
+
+def messages_contain_image(messages: list[ChatMessage]) -> bool:
+    """检查消息中是否包含 OpenAI 兼容 image_url 内容块。"""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
+
+def is_vision_unsupported_error(error: BaseException | str) -> bool:
+    """识别常见的非视觉模型或兼容接口图片输入错误。"""
+    text = str(error).lower()
+    markers = (
+        "image_url",
+        "image input",
+        "image inputs",
+        "vision",
+        "multimodal",
+        "modalities",
+        "unsupported content",
+        "content type",
+        "does not support image",
+        "only text",
+    )
+    return any(marker in text for marker in markers)
 

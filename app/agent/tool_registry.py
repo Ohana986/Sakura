@@ -18,6 +18,7 @@ class Tool:
     parameters: dict[str, Any] = field(default_factory=dict)
     handler: ToolHandler | None = None
     requires_confirmation: bool = False
+    confirmation_risk: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class ToolRegistry:
 
     def __init__(self, tools: list[Tool] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
+        self.free_access_enabled = False
         for tool in tools or []:
             self.register(tool)
 
@@ -68,6 +70,10 @@ class ToolRegistry:
             for tool in self.all()
         ]
 
+    def set_free_access_enabled(self, enabled: bool) -> None:
+        """开启后普通确认工具直接执行，文件删除类高风险工具仍保留确认。"""
+        self.free_access_enabled = enabled
+
     def prepare_or_execute(
         self,
         name: str,
@@ -76,6 +82,8 @@ class ToolRegistry:
     ) -> ToolExecutionResult | PendingToolAction:
         tool = self.get(name)
         if tool is None or not tool.requires_confirmation:
+            return self.execute(name, arguments)
+        if self.free_access_enabled and not _is_file_delete_risk(tool):
             return self.execute(name, arguments)
         if not isinstance(arguments, dict):
             return ToolExecutionResult(
@@ -128,3 +136,22 @@ class ToolRegistry:
             success=True,
             content=content if isinstance(content, (dict, str)) else str(content),
         )
+
+
+def _is_file_delete_risk(tool: Tool) -> bool:
+    """识别删除文件相关高风险工具，避免自由访问模式误放行。"""
+    if tool.confirmation_risk in {"delete_file", "file_delete", "destructive_file"}:
+        return True
+    normalized = tool.name.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "delete_file",
+            "remove_file",
+            "unlink_file",
+            "delete_path",
+            "remove_path",
+            "delete_local_file",
+            "remove_local_file",
+        )
+    )

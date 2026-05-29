@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QAction, QCursor, QFont, QFontDatabase, QIcon, QMouseEvent, QPixmap
@@ -41,6 +42,11 @@ from app.chat_reply import ChatReply, ChatSegment
 from app.chat_worker import ChatWorker, EventWorker
 from app.env_config import load_env_file, save_env_values
 from app.history_window import HistoryWindow
+from app.screen_observation import (
+    append_observation_marker,
+    build_screen_observation_user_message,
+    capture_screen_observation,
+)
 from app.settings_dialog import SettingsDialog
 from app.tts import (
     GPTSoVITSTTSProvider,
@@ -58,6 +64,8 @@ REMINDER_CHECK_INTERVAL_MS = 30_000
 SUBTITLE_LANGUAGE_KEY = "SUBTITLE_LANGUAGE"
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
+SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
+SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 
 
 class PetWindow(QWidget):
@@ -79,19 +87,23 @@ class PetWindow(QWidget):
         self.system_prompt = load_character_system_prompt(character_profile)
         self.memory_store = MemoryStore(base_dir / "data" / "memory.json")
         self.reminder_store = ReminderStore(base_dir / "data" / "reminders.json")
+        self.tool_registry = create_builtin_tool_registry(base_dir, self.memory_store, self.reminder_store)
         self.agent_runtime = AgentRuntime(
             api_client=api_client,
             system_prompt=self.system_prompt,
             reply_tones=character_profile.reply_tones,
-            tools=create_builtin_tool_registry(base_dir, self.memory_store, self.reminder_store),
+            tools=self.tool_registry,
             memory=self.memory_store,
         )
         self.tts_provider = tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = self._create_history_store(character_profile)
         self.subtitle_language = self._load_subtitle_language()
+        self.screen_observation_enabled = self._load_screen_observation_enabled()
+        self.model_vision_enabled = False
+        self.free_access_enabled = False
         self.history_window: HistoryWindow | None = None
-        self.messages: list[dict[str, str]] = []
+        self.messages: list[dict[str, Any]] = []
         self.portrait_pixmap_cache: dict[Path, QPixmap] = {}
         self.thread: QThread | None = None
         self.worker: ChatWorker | None = None
@@ -110,6 +122,7 @@ class PetWindow(QWidget):
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
         self.pending_tool_action: PendingToolAction | None = None
+        self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
         self.speech_timer = QTimer(self)
@@ -426,6 +439,19 @@ class PetWindow(QWidget):
         subtitle_action.triggered.connect(self._toggle_chinese_subtitles)
         menu.addAction(subtitle_action)
 
+        vision_action = QAction("启用模型视觉", self)
+        vision_action.setCheckable(True)
+        vision_action.setChecked(self.model_vision_enabled)
+        vision_action.setEnabled(self.screen_observation_enabled)
+        vision_action.triggered.connect(self._toggle_model_vision)
+        menu.addAction(vision_action)
+
+        free_access_action = QAction("自由访问权限", self)
+        free_access_action.setCheckable(True)
+        free_access_action.setChecked(self.free_access_enabled)
+        free_access_action.triggered.connect(self._toggle_free_access)
+        menu.addAction(free_access_action)
+
         menu.addSeparator()
 
         history_action = QAction("历史记录", self)
@@ -473,15 +499,19 @@ class PetWindow(QWidget):
         self.pending_reply_segments = []
         self._reset_current_segment_progress()
         self.set_speech("......")
-        next_messages = [*self.messages, {"role": "user", "content": text}]
-        self.messages = next_messages
-        self._record_history("user", text)
-        self._set_busy(True)
 
+        request_user_message: dict[str, Any] = {"role": "user", "content": text}
+
+        request_messages = [*self.messages, request_user_message]
+        self._record_user_message(text)
+        self._start_chat_worker(request_messages)
+
+    def _start_chat_worker(self, request_messages: list[dict[str, Any]]) -> None:
+        self._set_busy(True)
         self.thread = QThread(self)
         self.worker = ChatWorker(
             self.agent_runtime,
-            next_messages,
+            request_messages,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -494,11 +524,39 @@ class PetWindow(QWidget):
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:
+        if self._queue_screen_observation_followup(result):
+            return
         reply = result.reply
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_history("assistant", reply.text, reply.translation)
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
+
+    def _queue_screen_observation_followup(self, result: AgentResult) -> bool:
+        if not any(action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions):
+            return False
+        if not self.screen_observation_enabled or not self.model_vision_enabled:
+            self._consume_agent_result(_build_screen_observation_disabled_result())
+            return True
+        if not self.messages or self.messages[-1].get("role") != "user":
+            self._consume_agent_result(_build_screen_observation_failed_result("缺少可关联的用户消息。"))
+            return True
+
+        text = str(self.messages[-1].get("content", ""))
+        try:
+            observation = capture_screen_observation(self)
+        except RuntimeError as exc:
+            self._consume_agent_result(_build_screen_observation_failed_result(str(exc)))
+            return True
+
+        observed_message = build_screen_observation_user_message(text, observation)
+        self.messages[-1] = {"role": "user", "content": append_observation_marker(text, observation)}
+        self.pending_screen_observation_messages = [*self.messages[:-1], observed_message]
+        return True
+
+    def _record_user_message(self, text: str) -> None:
+        self.messages.append({"role": "user", "content": text})
+        self._record_history("user", text)
 
     @Slot()
     def confirm_pending_action(self) -> None:
@@ -643,6 +701,11 @@ class PetWindow(QWidget):
             self.thread.deleteLater()
         self.worker = None
         self.thread = None
+        if self.pending_screen_observation_messages is not None:
+            request_messages = self.pending_screen_observation_messages
+            self.pending_screen_observation_messages = None
+            self._start_chat_worker(request_messages)
+            return
         self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
@@ -715,6 +778,7 @@ class PetWindow(QWidget):
             self.base_dir,
             self.character_registry,
             self.character_profile,
+            self.screen_observation_enabled,
             self,
         )
         if (
@@ -722,6 +786,7 @@ class PetWindow(QWidget):
             or dialog.result_api_settings is None
             or dialog.result_tts_settings is None
             or dialog.result_character_id is None
+            or dialog.result_screen_observation_enabled is None
         ):
             return
 
@@ -735,6 +800,10 @@ class PetWindow(QWidget):
             dialog.result_api_settings.save(self.env_path)
             dialog.result_tts_settings.save(self.env_path, self.base_dir)
             self.character_registry.save_current_id(self.env_path, selected_profile.id)
+            save_env_values(
+                self.env_path,
+                {SCREEN_OBSERVATION_ENABLED_KEY: _format_bool(dialog.result_screen_observation_enabled)},
+            )
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
             return
@@ -744,10 +813,15 @@ class PetWindow(QWidget):
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
+        self.screen_observation_enabled = dialog.result_screen_observation_enabled
+        if not self.screen_observation_enabled:
+            self._set_model_vision_enabled(False)
         self._discard_prepared_next_tts()
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider
         self._apply_character(selected_profile)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
         QMessageBox.information(self, "保存成功", "设置已保存，后续聊天和朗读将使用新配置。")
 
     @Slot(bool)
@@ -770,6 +844,24 @@ class PetWindow(QWidget):
         self._restart_current_segment_speech()
         if self.history_window is not None:
             self.history_window.set_subtitle_language(self.subtitle_language)
+
+    @Slot(bool)
+    def _toggle_model_vision(self, checked: bool) -> None:
+        self._set_model_vision_enabled(checked)
+
+    def _set_model_vision_enabled(self, enabled: bool) -> None:
+        enabled = enabled and self.screen_observation_enabled
+        self.model_vision_enabled = enabled
+        self.agent_runtime.set_model_vision_enabled(enabled)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+
+    @Slot(bool)
+    def _toggle_free_access(self, checked: bool) -> None:
+        self.free_access_enabled = checked
+        self.tool_registry.set_free_access_enabled(checked)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
 
     def _create_tts_provider_from_settings(
         self,
@@ -983,6 +1075,14 @@ class PetWindow(QWidget):
             return SUBTITLE_LANGUAGE_ZH
         return SUBTITLE_LANGUAGE_JA
 
+    def _load_screen_observation_enabled(self) -> bool:
+        try:
+            values = load_env_file(self.env_path)
+        except OSError:
+            return True
+
+        return _parse_bool(values.get(SCREEN_OBSERVATION_ENABLED_KEY), default=True)
+
     def _apply_character(self, profile: CharacterProfile) -> None:
         previous_character_id = self.character_profile.id
         self.character_profile = profile
@@ -1025,6 +1125,49 @@ class PetWindow(QWidget):
             history_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
         except OSError as exc:
             print(f"[History] 旧历史迁移失败：{exc}")
+
+
+def _build_screen_observation_disabled_result() -> AgentResult:
+    return AgentResult(
+        reply=ChatReply(
+            [
+                ChatSegment(
+                    text="画面を見る設定がオフになっているよ。設定で許可してから、もう一度頼んで。",
+                    tone="提醒",
+                    translation="屏幕观察现在是关闭的。请在设置里允许按需屏幕观察后再试。",
+                )
+            ]
+        )
+    )
+
+
+def _build_screen_observation_failed_result(message: str) -> AgentResult:
+    return AgentResult(
+        reply=ChatReply(
+            [
+                ChatSegment(
+                    text="今は画面を取得できなかったみたい。権限や表示環境を確認して。",
+                    tone="困惑",
+                    translation=f"这次没能获取屏幕截图：{message}",
+                )
+            ]
+        )
+    )
+
+
+def _parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _format_bool(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _rounded_japanese_font(point_size: int, weight: QFont.Weight) -> QFont:

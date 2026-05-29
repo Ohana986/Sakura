@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtCore import QObject, Signal, Slot
 
 from app.agent import AgentEvent, AgentResult, AgentRuntime, PendingToolAction
@@ -12,7 +14,7 @@ class ChatWorker(QObject):
     def __init__(
         self,
         agent_runtime: AgentRuntime,
-        messages: list[dict[str, str]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
         confirmed_action: PendingToolAction | None = None,
         cancelled_action: PendingToolAction | None = None,
     ) -> None:

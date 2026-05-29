@@ -53,6 +53,7 @@ class SettingsDialog(QDialog):
         base_dir: Path,
         character_registry: CharacterRegistry | None = None,
         current_character: CharacterProfile | None = None,
+        screen_observation_enabled: bool = True,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
@@ -63,6 +64,7 @@ class SettingsDialog(QDialog):
         self.result_api_settings: ApiSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
+        self.result_screen_observation_enabled: bool | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
 
@@ -74,6 +76,7 @@ class SettingsDialog(QDialog):
             tabs.addTab(self._build_character_tab(character_registry, current_character), "角色")
         tabs.addTab(self._build_api_tab(api_settings), "API")
         tabs.addTab(self._build_tts_tab(tts_settings), "TTS")
+        tabs.addTab(self._build_privacy_tab(screen_observation_enabled), "隐私")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
@@ -211,6 +214,18 @@ class SettingsDialog(QDialog):
         tab.setLayout(form_layout)
         return tab
 
+    def _build_privacy_tab(self, screen_observation_enabled: bool) -> QWidget:
+        tab = QWidget(self)
+        self.screen_observation_enabled_check = QCheckBox("允许按需屏幕观察", tab)
+        self.screen_observation_enabled_check.setChecked(screen_observation_enabled)
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(16, 18, 16, 16)
+        form_layout.setSpacing(12)
+        form_layout.addRow("", self.screen_observation_enabled_check)
+        tab.setLayout(form_layout)
+        return tab
+
     def accept(self) -> None:
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
@@ -226,6 +241,7 @@ class SettingsDialog(QDialog):
         self.result_api_settings = api_settings
         self.result_tts_settings = tts_settings
         self.result_character_id = self._selected_character_id()
+        self.result_screen_observation_enabled = self.screen_observation_enabled_check.isChecked()
         super().accept()
 
     def reject(self) -> None:

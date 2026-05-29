@@ -7,11 +7,19 @@ from typing import Any
 from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
 from app.agent.memory import MemoryStore
 from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
-from app.api_client import OpenAICompatibleClient
+from app.api_client import (
+    ApiRequestError,
+    ChatMessage,
+    OpenAICompatibleClient,
+    is_vision_unsupported_error,
+    messages_contain_image,
+)
 from app.chat_reply import ChatReply, parse_chat_reply
 
 
 MAX_TOOL_CALLS_PER_TURN = 3
+OBSERVE_SCREEN_TOOL_NAME = "observe_screen"
+SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 
 
 class AgentRuntime:
@@ -30,18 +38,31 @@ class AgentRuntime:
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
+        self.model_vision_enabled = False
 
     def update_character(self, system_prompt: str, reply_tones: list[str] | None = None) -> None:
         """角色切换后同步系统提示词和可用语气列表。"""
         self.system_prompt = system_prompt
         self.reply_tones = [*reply_tones] if reply_tones is not None else []
 
-    def handle_user_message(self, messages: list[dict[str, str]]) -> AgentResult:
-        first_content = self.api_client.complete_raw(
-            self._build_tool_planning_prompt(),
-            messages,
-            temperature=0.8,
-        )
+    def set_model_vision_enabled(self, enabled: bool) -> None:
+        """允许模型在需要时请求一次当前屏幕截图。"""
+        self.model_vision_enabled = enabled
+
+    def handle_user_message(self, messages: list[ChatMessage]) -> AgentResult:
+        try:
+            first_content = self.api_client.complete_raw(
+                self._build_tool_planning_prompt(
+                    allow_screen_observation=self.model_vision_enabled
+                    and not messages_contain_image(messages)
+                ),
+                messages,
+                temperature=0.8,
+            )
+        except ApiRequestError as exc:
+            if messages_contain_image(messages) and is_vision_unsupported_error(exc):
+                return AgentResult(reply=_build_vision_unsupported_reply())
+            raise
         agent_data = _load_json_object(first_content)
         if agent_data is None:
             return AgentResult(reply=parse_chat_reply(first_content))
@@ -53,6 +74,26 @@ class AgentRuntime:
         execution_results: list[ToolExecutionResult] = []
         pending_actions: list[PendingToolAction] = []
         for call in tool_calls[:MAX_TOOL_CALLS_PER_TURN]:
+            if call["name"] == OBSERVE_SCREEN_TOOL_NAME:
+                if self.model_vision_enabled and not messages_contain_image(messages):
+                    return AgentResult(
+                        reply=_build_screen_observation_request_reply(),
+                        actions=[
+                            AgentAction(
+                                type=SCREEN_OBSERVATION_REQUEST_ACTION,
+                                payload={"reason": call.get("reason", "")},
+                            )
+                        ],
+                    )
+                execution_results.append(
+                    ToolExecutionResult(
+                        tool_name=OBSERVE_SCREEN_TOOL_NAME,
+                        success=False,
+                        content="",
+                        error="模型视觉未启用，或本轮已经提供过屏幕截图。",
+                    )
+                )
+                continue
             prepared = self.tools.prepare_or_execute(
                 call["name"],
                 call["arguments"],
@@ -190,9 +231,12 @@ class AgentRuntime:
             ],
         )
 
-    def _build_tool_planning_prompt(self) -> str:
+    def _build_tool_planning_prompt(self, allow_screen_observation: bool = False) -> str:
+        tools = self.tools.describe_tools()
+        if allow_screen_observation:
+            tools.append(_describe_screen_observation_tool())
         tool_descriptions = json.dumps(
-            self.tools.describe_tools(),
+            tools,
             ensure_ascii=False,
             indent=2,
         )
@@ -241,6 +285,7 @@ class AgentRuntime:
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
 - requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
+- observe_screen 只在确实需要当前屏幕内容时调用；如果文字信息已经足够回答，不要截图。
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
 - 不要静默写入长期记忆；只有用户明确要求记住时，才使用 propose_memory_update。
@@ -380,6 +425,35 @@ def _describe_pending_action(action: PendingToolAction) -> str:
     return f"执行 {action.tool_name}"
 
 
+def _describe_screen_observation_tool() -> dict[str, Any]:
+    return {
+        "name": OBSERVE_SCREEN_TOOL_NAME,
+        "description": "请求获取当前屏幕截图。仅当用户问题需要当前界面、窗口内容或视觉状态时使用。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+        "requires_confirmation": False,
+    }
+
+
+def _build_screen_observation_request_reply() -> ChatReply:
+    return parse_chat_reply(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "ja": "画面を確認してから答えるね。",
+                        "zh": "我先看一下当前画面再回答。",
+                        "tone": "提醒",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def _build_fallback_tool_reply(results: list[ToolExecutionResult]) -> ChatReply:
     if not results:
         return parse_chat_reply("ツール結果の確認に失敗したよ。")
@@ -414,6 +488,23 @@ def _build_fallback_tool_reply(results: list[ToolExecutionResult]) -> ChatReply:
                     {
                         "ja": "処理中に問題が起きたみたい。設定かネットワークを確認して。",
                         "zh": f"工具执行时出了点问题：{error_text}",
+                        "tone": "困惑",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _build_vision_unsupported_reply() -> ChatReply:
+    return parse_chat_reply(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "ja": "今のモデルでは画像を見られないみたい。画面の内容は勝手に想像しないでおくね。",
+                        "zh": "当前模型或接口似乎不支持图片输入。我不会猜屏幕内容，请换成支持视觉的模型后再试。",
                         "tone": "困惑",
                     }
                 ]
