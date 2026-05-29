@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.agent.actions import AgentAction, AgentResult
+from app.agent.actions import AgentAction, AgentResult, MemoryUpdate
 from app.agent.memory import MemoryStore
 from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
 from app.api_client import OpenAICompatibleClient
@@ -84,6 +84,7 @@ class AgentRuntime:
                 )
                 for result in execution_results
             ],
+            memory_updates=_extract_memory_updates(execution_results),
         )
 
     def _build_tool_planning_prompt(self) -> str:
@@ -93,12 +94,16 @@ class AgentRuntime:
             indent=2,
         )
         tones = "、".join(tone for tone in self.reply_tones if tone.strip()) or "中性"
+        memory_summary = self._memory_summary()
         return f"""
 {self.system_prompt.strip()}
 
 你现在可以作为桌面陪伴型 Agent 判断是否需要调用内部工具。
 你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
 如果需要工具，返回 reply 和 tool_calls；如果不需要工具，tool_calls 返回空数组或省略。
+
+长期记忆摘要：
+{memory_summary}
 
 可用工具：
 {tool_descriptions}
@@ -121,6 +126,9 @@ class AgentRuntime:
 - zh 中只写 ja 对应的自然中文译文，必须是中文。
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
+- 不要静默写入长期记忆；只有用户明确要求记住时，才使用 propose_memory_update。
+- 只有用户明确确认候选记忆时，才使用 confirm_memory_update。
+- 只有用户明确要求忘掉信息时，才使用 forget_memory。
 """.strip()
 
     def _build_final_reply_prompt(self) -> str:
@@ -130,6 +138,12 @@ class AgentRuntime:
 你会收到上一轮工具调用结果。请基于这些结果给用户最终回复。
 不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。
 """.strip()
+
+    def _memory_summary(self) -> str:
+        try:
+            return self.memory.summary()
+        except Exception as exc:
+            return f"长期记忆读取失败：{exc}"
 
 
 def _load_json_object(content: str) -> dict[str, Any] | None:
@@ -184,3 +198,30 @@ def _format_tool_results_for_model(results: list[ToolExecutionResult]) -> str:
             indent=2,
         )
     )
+
+
+def _extract_memory_updates(results: list[ToolExecutionResult]) -> list[MemoryUpdate]:
+    updates: list[MemoryUpdate] = []
+    for result in results:
+        if result.tool_name != "propose_memory_update" or not result.success:
+            continue
+        if not isinstance(result.content, dict):
+            continue
+        raw_update = result.content.get("pending_update")
+        if not isinstance(raw_update, dict):
+            continue
+        update_id = raw_update.get("id")
+        category = raw_update.get("category")
+        content = raw_update.get("content")
+        reason = raw_update.get("reason", "")
+        if not all(isinstance(value, str) and value.strip() for value in (update_id, category, content)):
+            continue
+        updates.append(
+            MemoryUpdate(
+                id=update_id.strip(),
+                category=category.strip(),
+                content=content.strip(),
+                reason=reason.strip() if isinstance(reason, str) else "",
+            )
+        )
+    return updates

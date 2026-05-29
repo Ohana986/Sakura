@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.agent import AgentResult, AgentRuntime, create_builtin_tool_registry
+from app.agent import AgentResult, AgentRuntime, MemoryStore, create_builtin_tool_registry
 from app.api_client import OpenAICompatibleClient
 from app.chat_worker import ChatWorker
 from app.tts import TTSProvider
@@ -33,10 +33,12 @@ class ChatWindow(QWidget):
         base_dir = base_dir or Path(__file__).resolve().parents[1]
         self.api_client = api_client
         self.system_prompt = system_prompt
+        self.memory_store = MemoryStore(base_dir / "data" / "memory.json")
         self.agent_runtime = AgentRuntime(
             api_client=api_client,
             system_prompt=system_prompt,
-            tools=create_builtin_tool_registry(base_dir),
+            tools=create_builtin_tool_registry(base_dir, self.memory_store),
+            memory=self.memory_store,
         )
         self.tts_provider = tts_provider
         self.messages: list[dict[str, str]] = []
