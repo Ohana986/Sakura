@@ -52,6 +52,7 @@ from app.character_loader import (
 )
 from app.chat_history import ChatHistoryStore
 from app.chat_reply import ChatReply, ChatSegment
+from app.context_trimming import trim_messages_for_model
 from app.chat_worker import ChatWorker, EventWorker
 from app.env_config import load_env_file, save_env_values
 from app.history_window import HistoryWindow
@@ -626,7 +627,7 @@ class PetWindow(QWidget):
 
         request_user_message: dict[str, Any] = {"role": "user", "content": text}
 
-        request_messages = [*self.messages, request_user_message]
+        request_messages = trim_messages_for_model([*self.messages, request_user_message])
         self._record_user_message(text)
         self._start_chat_worker(request_messages)
 
@@ -675,7 +676,9 @@ class PetWindow(QWidget):
 
         observed_message = build_screen_observation_user_message(text, observation)
         self.messages[-1] = {"role": "user", "content": append_observation_marker(text, observation)}
-        self.pending_screen_observation_messages = [*self.messages[:-1], observed_message]
+        self.pending_screen_observation_messages = trim_messages_for_model(
+            [*self.messages[:-1], observed_message]
+        )
         return True
 
     def _record_user_message(self, text: str) -> None:
@@ -920,6 +923,10 @@ class PetWindow(QWidget):
             QMessageBox.critical(self, "角色配置无效", str(exc))
             return
 
+        new_tts_provider = self._create_tts_provider_from_settings(dialog.result_tts_settings)
+        if new_tts_provider is None:
+            return
+
         try:
             dialog.result_api_settings.save(self.env_path)
             dialog.result_tts_settings.save(self.env_path, self.base_dir)
@@ -930,10 +937,6 @@ class PetWindow(QWidget):
             )
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
-            return
-
-        new_tts_provider = self._create_tts_provider_from_settings(dialog.result_tts_settings)
-        if new_tts_provider is None:
             return
 
         self.api_client.update_settings(dialog.result_api_settings)

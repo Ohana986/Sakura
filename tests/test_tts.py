@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 if importlib.util.find_spec("PySide6") is None:
@@ -68,7 +69,7 @@ if importlib.util.find_spec("PySide6") is None:
     sys.modules["PySide6.QtCore"] = qtcore_module
     sys.modules["PySide6.QtMultimedia"] = qtmultimedia_module
 
-from app.tts import _load_tone_references, _resolve_request_text_lang
+from app.tts import GPTSoVITSTTSProvider, GPTSoVITSTTSSettings, _load_tone_references, _resolve_request_text_lang
 
 
 def test_tts_mixed_japanese_and_english_uses_auto_lang() -> None:
@@ -105,3 +106,55 @@ def test_tone_references_load_four_part_rows_only() -> None:
     assert references
     assert all("|" not in reference.ref_text for items in references.values() for reference in items)
     assert all(reference.ref_audio_path.exists() for items in references.values() for reference in items)
+
+
+def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings()
+    provider._service_checked = False
+    messages: list[str] = []
+
+    def fake_urlopen(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("app.tts.urllib.request.urlopen", fake_urlopen)
+
+    assert not GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
+    assert "服务不可用" in messages[0]
+    assert "http://127.0.0.1:9880/tts" in messages[0]
+
+
+def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings()
+    messages: list[str] = []
+
+    def fake_urlopen(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.URLError("bad weights")
+
+    monkeypatch.setattr("app.tts.urllib.request.urlopen", fake_urlopen)
+
+    ok = GPTSoVITSTTSProvider._request_weight_switch(
+        provider,
+        "set_gpt_weights",
+        Path("characters/sakura/voice/models/Sakura-e15.ckpt"),
+        messages.append,
+    )
+
+    assert not ok
+    assert "set_gpt_weights" in messages[0]
+    assert "Sakura-e15.ckpt" in messages[0]
+    assert "bad weights" in messages[0]
+
+
+def _minimal_tts_settings() -> GPTSoVITSTTSSettings:
+    return GPTSoVITSTTSSettings(
+        enabled=True,
+        api_url="http://127.0.0.1:9880/tts",
+        ref_audio_path=Path("characters/sakura/voice/refs/tone_refs/00_中性_VO01_2785.ogg"),
+        ref_text_path=Path("characters/sakura/voice/refs/ref.txt"),
+        ref_text="テスト",
+        ref_lang="ja",
+        text_lang="ja",
+        timeout_seconds=1,
+    )

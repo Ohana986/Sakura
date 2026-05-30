@@ -18,6 +18,18 @@ from app.env_config import load_env_file, save_env_values
 MAX_API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 0.8
 ChatMessage = dict[str, Any]
+SUPPORTED_CHAT_COMPLETION_PARAMS = {
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "response_format",
+    "stream",
+    "tools",
+    "tool_choice",
+}
 
 SEGMENTED_REPLY_INSTRUCTION_TEMPLATE = """
 你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
@@ -162,21 +174,18 @@ class OpenAICompatibleClient:
         system_prompt: str,
         messages: list[ChatMessage],
         temperature: float = 0.8,
+        **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
         self._ensure_chat_config("缺少 API_KEY。请在 .env 中配置 API_KEY、BASE_URL、MODEL。")
 
-        payload = {
-            "model": self.settings.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt.strip(),
-                },
-                *messages,
-            ],
-            "temperature": temperature,
-        }
+        payload = _build_chat_completion_payload(
+            model=self.settings.model,
+            system_prompt=system_prompt,
+            messages=messages,
+            temperature=temperature,
+            chat_params=chat_params,
+        )
         data = self._post_chat_completions(payload)
 
         try:
@@ -256,6 +265,42 @@ def _build_segmented_reply_instruction(reply_tones: list[str] | None) -> str:
     return SEGMENTED_REPLY_INSTRUCTION_TEMPLATE.strip().replace("{tones}", "、".join(tones))
 
 
+def _build_chat_completion_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    messages: list[ChatMessage],
+    temperature: float,
+    chat_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """构建 OpenAI 兼容请求体，并丢弃已知非标准参数。"""
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt.strip(),
+            },
+            *messages,
+        ],
+        "temperature": temperature,
+    }
+    payload.update(_filter_supported_chat_params(chat_params or {}))
+    return payload
+
+
+def _filter_supported_chat_params(params: dict[str, Any]) -> dict[str, Any]:
+    """过滤兼容端点常见不支持的内部参数，避免请求在网关层失败。"""
+    filtered: dict[str, Any] = {}
+    for key, value in params.items():
+        if key not in SUPPORTED_CHAT_COMPLETION_PARAMS or value is None:
+            continue
+        if key == "max_tokens" and params.get("max_completion_tokens") is not None:
+            continue
+        filtered[key] = value
+    return filtered
+
+
 def messages_contain_image(messages: list[ChatMessage]) -> bool:
     """检查消息中是否包含 OpenAI 兼容 image_url 内容块。"""
     for message in messages:
@@ -284,4 +329,3 @@ def is_vision_unsupported_error(error: BaseException | str) -> bool:
         "only text",
     )
     return any(marker in text for marker in markers)
-

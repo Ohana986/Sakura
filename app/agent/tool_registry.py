@@ -19,6 +19,8 @@ class Tool:
     handler: ToolHandler | None = None
     requires_confirmation: bool = False
     confirmation_risk: str = "normal"
+    group: str = "default"
+    risk: str = "low"
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,8 @@ class ToolRegistry:
                 "description": tool.description,
                 "parameters": tool.parameters,
                 "requires_confirmation": tool.requires_confirmation,
+                "group": tool.group,
+                "risk": tool.risk,
             }
             for tool in self.all()
         ]
@@ -83,7 +87,7 @@ class ToolRegistry:
         tool = self.get(name)
         if tool is None or not tool.requires_confirmation:
             return self.execute(name, arguments)
-        if self.free_access_enabled and not _is_file_delete_risk(tool):
+        if self.free_access_enabled and not _requires_confirmation_despite_free_access(tool):
             return self.execute(name, arguments)
         if not isinstance(arguments, dict):
             return ToolExecutionResult(
@@ -138,8 +142,10 @@ class ToolRegistry:
         )
 
 
-def _is_file_delete_risk(tool: Tool) -> bool:
-    """识别删除文件相关高风险工具，避免自由访问模式误放行。"""
+def _requires_confirmation_despite_free_access(tool: Tool) -> bool:
+    """识别自由访问模式也不能直接执行的高风险工具。"""
+    if tool.risk == "high":
+        return True
     if tool.confirmation_risk in {"delete_file", "file_delete", "destructive_file"}:
         return True
     normalized = tool.name.lower()

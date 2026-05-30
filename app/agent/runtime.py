@@ -18,6 +18,7 @@ from app.chat_reply import ChatReply, parse_chat_reply
 
 
 MAX_TOOL_CALLS_PER_TURN = 3
+MAX_TOOL_RESULT_CHARS = 6000
 OBSERVE_SCREEN_TOOL_NAME = "observe_screen"
 SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 
@@ -411,14 +412,46 @@ def _format_tool_results_for_model(results: list[ToolExecutionResult]) -> str:
 def _redact_tool_result_for_model(result: ToolExecutionResult) -> dict[str, Any]:
     data = result.to_dict()
     content = data.get("content")
+    if isinstance(content, str):
+        data["content"] = _truncate_text_for_model(content, MAX_TOOL_RESULT_CHARS)
+        return data
     if not isinstance(content, dict):
         return data
 
     redacted = dict(content)
     if redacted.pop("screenshot_data_url", None):
         redacted["screenshot_attached"] = True
-    data["content"] = redacted
+    data["content"] = _truncate_value_for_model(redacted, MAX_TOOL_RESULT_CHARS)
     return data
+
+
+def _truncate_value_for_model(value: Any, max_chars: int) -> Any:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return value
+    head_chars = max(1, max_chars // 2)
+    tail_chars = max(0, max_chars - head_chars)
+    return {
+        "truncated": True,
+        "original_chars": len(text),
+        "omitted_chars": max(0, len(text) - head_chars - tail_chars),
+        "head": text[:head_chars],
+        "tail": text[-tail_chars:] if tail_chars else "",
+    }
+
+
+def _truncate_text_for_model(text: str, max_chars: int) -> str | dict[str, Any]:
+    if len(text) <= max_chars:
+        return text
+    head_chars = max(1, max_chars // 2)
+    tail_chars = max(0, max_chars - head_chars)
+    return {
+        "truncated": True,
+        "original_chars": len(text),
+        "omitted_chars": max(0, len(text) - head_chars - tail_chars),
+        "head": text[:head_chars],
+        "tail": text[-tail_chars:] if tail_chars else "",
+    }
 
 
 def _extract_tool_result_images(results: list[ToolExecutionResult]) -> list[str]:

@@ -11,8 +11,10 @@ from app.agent.builtin_tools import create_builtin_tool_registry
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.runtime import AgentRuntime, SCREEN_OBSERVATION_REQUEST_ACTION, _build_tool_results_message
+from app.agent.runtime import _redact_tool_result_for_model
 from app.agent.tool_registry import Tool, ToolExecutionResult, ToolRegistry
 from app.api_client import ApiRequestError, is_vision_unsupported_error, messages_contain_image
+from app.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
 from app.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
     ScreenObservation,
@@ -165,6 +167,44 @@ def test_tool_registry_free_access_keeps_file_delete_confirmation() -> None:
     assert result.tool_name == "delete_file"
 
 
+def test_tool_registry_free_access_keeps_high_risk_confirmation() -> None:
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="run_external_action",
+                description="执行高风险动作",
+                handler=lambda _arguments: {"done": True},
+                requires_confirmation=True,
+                risk="high",
+            )
+        ]
+    )
+    registry.set_free_access_enabled(True)
+
+    result = registry.prepare_or_execute("run_external_action", {"value": "x"})
+
+    assert isinstance(result, PendingToolAction)
+    assert result.tool_name == "run_external_action"
+
+
+def test_tool_registry_describes_group_and_risk_metadata() -> None:
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="search_memory",
+                description="搜索记忆",
+                group="memory",
+                risk="low",
+            )
+        ]
+    )
+
+    description = registry.describe_tools()[0]
+
+    assert description["group"] == "memory"
+    assert description["risk"] == "low"
+
+
 def test_builtin_registry_includes_browser_tools() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
 
@@ -290,6 +330,39 @@ def test_browser_screenshot_fallback_is_not_attached_without_vision() -> None:
     assert isinstance(message["content"], str)
     assert "screenshot_data_url" not in message["content"]
     assert "screenshot_attached" in message["content"]
+
+
+def test_tool_result_for_model_truncates_large_content() -> None:
+    result = ToolExecutionResult(
+        tool_name="browser_get_content",
+        success=True,
+        content={
+            "url": "https://example.com",
+            "text": "x" * 7000,
+        },
+    )
+
+    redacted = _redact_tool_result_for_model(result)
+
+    content = redacted["content"]
+    assert isinstance(content, dict)
+    assert content["truncated"] is True
+    assert content["original_chars"] > 6000
+    assert "head" in content
+    assert "tail" in content
+
+
+def test_trim_messages_for_model_keeps_recent_messages_without_mutating_history() -> None:
+    messages = [
+        {"role": "user", "content": f"message {index}"}
+        for index in range(MAX_MODEL_CONTEXT_MESSAGES + 5)
+    ]
+
+    trimmed = trim_messages_for_model(messages)
+
+    assert len(trimmed) == MAX_MODEL_CONTEXT_MESSAGES
+    assert trimmed[0]["content"] == "message 5"
+    assert len(messages) == MAX_MODEL_CONTEXT_MESSAGES + 5
 
 
 def test_model_vision_enabled_allows_model_to_request_screen_observation() -> None:

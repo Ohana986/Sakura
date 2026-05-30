@@ -340,6 +340,7 @@ class GPTSoVITSTTSProvider(QObject):
         self._request_running = False
         self._tone_indices: dict[str, int] = {}
         self._weights_ready = False
+        self._service_checked = False
 
         self._audio_output = QAudioOutput(self)
         self._player = QMediaPlayer(self)
@@ -449,9 +450,11 @@ class GPTSoVITSTTSProvider(QObject):
             if tts_request.prepared_audio is not None and tts_request.prepared_audio.cancelled:
                 return
 
-            if not self._ensure_character_weights(
-                lambda message: self._fail_audio_request(tts_request, message)
-            ):
+            fail = lambda message: self._fail_audio_request(tts_request, message)
+            if not self._ensure_service_available(fail):
+                return
+
+            if not self._ensure_character_weights(fail):
                 return
 
             reference = self._select_reference(tts_request.tone)
@@ -492,7 +495,10 @@ class GPTSoVITSTTSProvider(QObject):
                 self._fail_audio_request(tts_request, f"GPT-SoVITS HTTP {exc.code}: {error_body}")
                 return
             except urllib.error.URLError as exc:
-                self._fail_audio_request(tts_request, f"GPT-SoVITS 请求失败：{exc.reason}")
+                self._fail_audio_request(
+                    tts_request,
+                    f"GPT-SoVITS 请求失败，请确认服务已启动并可访问 {self.settings.api_url}：{exc.reason}",
+                )
                 return
             except TimeoutError:
                 self._fail_audio_request(tts_request, "GPT-SoVITS 请求超时。")
@@ -517,6 +523,35 @@ class GPTSoVITSTTSProvider(QObject):
             with self._request_lock:
                 self._request_running = False
             self._start_next_request()
+
+    def _ensure_service_available(
+        self,
+        fail_callback: Callable[[str], None],
+    ) -> bool:
+        if self._service_checked:
+            return True
+        request = urllib.request.Request(url=self.settings.api_url, method="GET")
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=min(self.settings.timeout_seconds, 3),
+            ) as response:
+                response.read(1)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                self._service_checked = True
+                return True
+            fail_callback(f"GPT-SoVITS 服务返回 HTTP {exc.code}，请检查服务状态：{self.settings.api_url}")
+            return False
+        except urllib.error.URLError as exc:
+            fail_callback(f"GPT-SoVITS 服务不可用，请先启动或检查地址 {self.settings.api_url}：{exc.reason}")
+            return False
+        except TimeoutError:
+            fail_callback(f"GPT-SoVITS 服务探测超时：{self.settings.api_url}")
+            return False
+
+        self._service_checked = True
+        return True
 
     def _ensure_character_weights(
         self,
@@ -554,13 +589,15 @@ class GPTSoVITSTTSProvider(QObject):
                 response.read()
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            fail_callback(f"GPT-SoVITS 切换权重失败 HTTP {exc.code}: {error_body}")
+            fail_callback(
+                f"GPT-SoVITS 切换权重失败（{endpoint}, {weights_path}）HTTP {exc.code}: {error_body}"
+            )
             return False
         except urllib.error.URLError as exc:
-            fail_callback(f"GPT-SoVITS 切换权重失败：{exc.reason}")
+            fail_callback(f"GPT-SoVITS 切换权重失败（{endpoint}, {weights_path}）：{exc.reason}")
             return False
         except TimeoutError:
-            fail_callback("GPT-SoVITS 切换权重超时。")
+            fail_callback(f"GPT-SoVITS 切换权重超时（{endpoint}, {weights_path}）。")
             return False
         return True
 
