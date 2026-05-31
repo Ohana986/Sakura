@@ -58,27 +58,27 @@ class ChatWindow(QWidget):
         self.setStyleSheet(
             """
             QWidget {
-                background: #f4fbfd;
-                color: #24343a;
+                background: #fff6fa;
+                color: #3d2b35;
                 font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
                 font-size: 14px;
             }
             QTextBrowser {
-                background: rgba(226, 246, 250, 0.86);
-                border: 1px solid rgba(120, 176, 188, 0.55);
+                background: rgba(255, 232, 241, 0.86);
+                border: 1px solid rgba(238, 172, 200, 0.55);
                 border-radius: 12px;
                 padding: 14px;
-                selection-background-color: #7cc8d7;
+                selection-background-color: #f1a9c6;
             }
             QLineEdit {
                 background: rgba(255, 255, 255, 0.92);
-                border: 1px solid rgba(120, 176, 188, 0.65);
+                border: 1px solid rgba(238, 172, 200, 0.65);
                 border-radius: 18px;
                 padding: 9px 14px;
             }
             QPushButton {
-                background: #72c7d6;
-                border: none;
+                background: #d55b91;
+                border: 1px solid rgba(177, 62, 115, 0.55);
                 border-radius: 18px;
                 color: white;
                 min-width: 72px;
@@ -86,10 +86,10 @@ class ChatWindow(QWidget):
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #5eb7c8;
+                background: #bf3f7a;
             }
             QPushButton:disabled {
-                background: #a9c7ce;
+                background: rgba(213, 91, 145, 0.42);
             }
             """
         )

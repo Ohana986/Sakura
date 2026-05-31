@@ -123,39 +123,72 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #f4fbfd;
-                color: #24343a;
+                background: #fff6fa;
+                color: #3d2b35;
                 font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
                 font-size: 14px;
             }
             QTabWidget::pane {
-                border: 1px solid rgba(120, 176, 188, 0.48);
+                border: 1px solid rgba(238, 172, 200, 0.54);
                 border-radius: 8px;
-                background: rgba(226, 246, 250, 0.70);
+                background: rgba(255, 232, 241, 0.70);
             }
             QTabBar::tab {
-                background: rgba(226, 246, 250, 0.75);
-                border: 1px solid rgba(120, 176, 188, 0.42);
+                background: rgba(255, 232, 241, 0.75);
+                border: 1px solid rgba(238, 172, 200, 0.48);
                 border-bottom: none;
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
                 padding: 7px 18px;
                 margin-right: 4px;
+                color: #7a3656;
             }
             QTabBar::tab:selected {
                 background: #ffffff;
-                color: #27616d;
+                color: #b13e73;
                 font-weight: 700;
             }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget, QComboBox {
                 background: rgba(255, 255, 255, 0.92);
-                border: 1px solid rgba(120, 176, 188, 0.50);
+                border: 1px solid rgba(238, 172, 200, 0.58);
                 border-radius: 7px;
                 padding: 6px 8px;
+                color: #3d2b35;
+                selection-background-color: rgba(213, 91, 145, 0.28);
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus, QComboBox:focus {
+                border: 1px solid rgba(213, 91, 145, 0.76);
+                background: #ffffff;
+            }
+            QTableWidget {
+                gridline-color: rgba(238, 172, 200, 0.42);
+                alternate-background-color: rgba(255, 244, 249, 0.86);
+            }
+            QHeaderView::section {
+                background: #ffe8f1;
+                border: 1px solid rgba(238, 172, 200, 0.52);
+                color: #7a3656;
+                padding: 6px;
+                font-weight: 700;
+            }
+            QCheckBox {
+                color: #4b3440;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid rgba(213, 91, 145, 0.68);
+                background: #ffffff;
+            }
+            QCheckBox::indicator:checked {
+                background: #d55b91;
+                border: 1px solid #b13e73;
             }
             QPushButton {
-                background: #72c7d6;
-                border: none;
+                background: #d55b91;
+                border: 1px solid rgba(177, 62, 115, 0.55);
                 border-radius: 8px;
                 color: white;
                 min-width: 72px;
@@ -163,7 +196,12 @@ class SettingsDialog(QDialog):
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #5eb7c8;
+                background: #bf3f7a;
+            }
+            QPushButton:disabled {
+                background: rgba(213, 91, 145, 0.42);
+                border: 1px solid rgba(238, 172, 200, 0.45);
+                color: rgba(255, 255, 255, 0.76);
             }
             """
         )
@@ -311,7 +349,7 @@ class SettingsDialog(QDialog):
             tab,
         )
         restart_hint.setWordWrap(True)
-        restart_hint.setStyleSheet("color: #6a7f86;")
+        restart_hint.setStyleSheet("color: #9b4f72;")
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)

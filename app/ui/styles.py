@@ -50,18 +50,18 @@ PET_WINDOW_STYLEHEET = """
     font-size: 15px;
     font-weight: 700;
     padding: 3px 16px;
-    selection-background-color: rgba(74, 170, 214, 185);
+    selection-background-color: rgba(213, 91, 145, 92);
 }
 #petInput:focus {
     background: rgba(255, 255, 255, 132);
-    border: 1px solid rgba(74, 170, 214, 230);
+    border: 1px solid rgba(213, 91, 145, 210);
 }
 #petInput:disabled {
     color: rgba(47, 38, 48, 150);
 }
 #sendButton {
-    background: rgba(74, 170, 214, 225);
-    border: none;
+    background: rgba(213, 91, 145, 232);
+    border: 1px solid rgba(255, 255, 255, 150);
     border-radius: 16px;
     color: white;
     font-size: 15px;
@@ -70,32 +70,37 @@ PET_WINDOW_STYLEHEET = """
     padding: 4px 14px;
 }
 #sendButton:hover {
-    background: rgba(48, 145, 195, 235);
+    background: rgba(191, 63, 122, 242);
+    border: 1px solid rgba(255, 241, 247, 190);
 }
 #sendButton:disabled {
-    background: rgba(126, 171, 193, 190);
+    background: rgba(213, 91, 145, 118);
+    border: 1px solid rgba(238, 172, 200, 92);
+    color: rgba(255, 255, 255, 178);
 }
 #screenshotButton {
-    background: rgba(255, 255, 255, 116);
-    border: 1px solid rgba(255, 255, 255, 218);
+    background: rgba(213, 91, 145, 232);
+    border: 1px solid rgba(255, 255, 255, 150);
     border-radius: 16px;
-    color: #4b3440;
+    color: white;
     font-size: 15px;
     font-weight: 800;
     min-width: 58px;
     padding: 4px 12px;
 }
 #screenshotButton:hover {
-    background: rgba(255, 255, 255, 150);
+    background: rgba(191, 63, 122, 242);
+    border: 1px solid rgba(255, 241, 247, 190);
 }
 #screenshotButton[screenshotAttached="true"] {
-    background: rgba(93, 181, 130, 225);
-    border: none;
+    background: rgba(177, 62, 115, 242);
+    border: 1px solid rgba(255, 221, 235, 220);
     color: white;
 }
 #screenshotButton:disabled {
-    background: rgba(176, 181, 184, 150);
-    color: rgba(75, 52, 64, 135);
+    background: rgba(213, 91, 145, 118);
+    border: 1px solid rgba(238, 172, 200, 92);
+    color: rgba(255, 255, 255, 178);
 }
 #confirmActionButton {
     background: rgba(93, 181, 130, 225);

@@ -102,40 +102,40 @@ class HistoryWindow(QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #f4fbfd;
-                color: #24343a;
+                background: #fff6fa;
+                color: #3d2b35;
                 font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
                 font-size: 16px;
             }
             QLabel#historyTitle {
-                color: #1f3d46;
+                color: #7a3656;
                 font-size: 22px;
                 font-weight: 700;
             }
             QLabel#historyCount {
-                color: #668892;
-                background: rgba(226, 246, 250, 0.72);
-                border: 1px solid rgba(120, 176, 188, 0.36);
+                color: #9b4f72;
+                background: rgba(255, 232, 241, 0.78);
+                border: 1px solid rgba(238, 172, 200, 0.48);
                 border-radius: 12px;
                 padding: 5px 10px;
                 font-size: 13px;
             }
             QScrollArea#historyScroll {
-                background: rgba(236, 250, 252, 0.92);
-                border: 1px solid rgba(120, 176, 188, 0.50);
+                background: rgba(255, 244, 249, 0.94);
+                border: 1px solid rgba(238, 172, 200, 0.54);
                 border-radius: 14px;
             }
             QWidget#historyContent {
                 background: transparent;
             }
             QFrame#assistantBubble {
-                background: #f2fbfc;
-                border: 1px solid #c9e8ee;
+                background: #fffafd;
+                border: 1px solid #f1c7d9;
                 border-radius: 14px;
             }
             QFrame#userBubble {
-                background: #cdeff5;
-                border: 1px solid #a7dbe4;
+                background: #ffe3ee;
+                border: 1px solid #eeb0ca;
                 border-radius: 14px;
             }
             QFrame#errorBubble {
@@ -144,16 +144,16 @@ class HistoryWindow(QDialog):
                 border-radius: 14px;
             }
             QFrame#systemBubble {
-                background: #e7f3f5;
-                border: 1px solid #cfe2e6;
+                background: #fff0f6;
+                border: 1px solid #efd0dc;
                 border-radius: 12px;
             }
             QLabel#entryMeta {
-                color: #6a8f98;
+                color: #a0647f;
                 font-size: 13px;
             }
             QLabel#entryText {
-                color: #24343a;
+                color: #3d2b35;
                 font-size: 16px;
                 line-height: 155%;
             }
@@ -163,41 +163,43 @@ class HistoryWindow(QDialog):
                 line-height: 155%;
             }
             QLabel#systemText {
-                color: #536b72;
+                color: #7e5d6b;
                 font-size: 15px;
                 line-height: 155%;
             }
             QPushButton {
-                background: rgba(255, 255, 255, 0.88);
-                border: 1px solid rgba(120, 176, 188, 0.50);
+                background: rgba(255, 255, 255, 0.90);
+                border: 1px solid rgba(238, 172, 200, 0.58);
                 border-radius: 8px;
-                color: #315760;
+                color: #7a3656;
                 min-width: 72px;
                 padding: 8px 12px;
                 font-size: 15px;
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: rgba(219, 244, 248, 0.95);
+                background: rgba(255, 232, 241, 0.96);
+                border: 1px solid rgba(213, 91, 145, 0.62);
             }
             QPushButton#dangerButton {
-                background: #fff3f2;
-                border: 1px solid rgba(221, 122, 122, 0.52);
-                color: #b4494a;
+                background: #fff1f5;
+                border: 1px solid rgba(199, 88, 122, 0.52);
+                color: #b13e5a;
             }
             QPushButton#dangerButton:hover {
-                background: #ffe5e3;
+                background: #ffe1ea;
             }
             QPushButton#primaryButton {
-                background: #5eb7c8;
-                border: 1px solid rgba(65, 146, 161, 0.55);
+                background: #d55b91;
+                border: 1px solid rgba(177, 62, 115, 0.55);
                 color: white;
             }
             QPushButton#primaryButton:hover {
-                background: #4aa9bb;
+                background: #bf3f7a;
             }
             QPushButton#secondaryButton:default {
-                background: #5eb7c8;
+                background: #d55b91;
+                color: white;
             }
             """
         )

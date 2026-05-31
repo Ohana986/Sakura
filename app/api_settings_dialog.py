@@ -55,6 +55,45 @@ class ApiSettingsDialog(QDialog):
         layout.addLayout(form_layout)
         layout.addWidget(buttons)
         self.setLayout(layout)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #fff6fa;
+                color: #3d2b35;
+                font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
+                font-size: 14px;
+            }
+            QLineEdit, QSpinBox {
+                background: rgba(255, 255, 255, 0.92);
+                border: 1px solid rgba(238, 172, 200, 0.58);
+                border-radius: 7px;
+                padding: 6px 8px;
+                color: #3d2b35;
+                selection-background-color: rgba(213, 91, 145, 0.28);
+            }
+            QLineEdit:focus, QSpinBox:focus {
+                border: 1px solid rgba(213, 91, 145, 0.76);
+                background: #ffffff;
+            }
+            QPushButton {
+                background: #d55b91;
+                border: 1px solid rgba(177, 62, 115, 0.55);
+                border-radius: 8px;
+                color: white;
+                min-width: 72px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #bf3f7a;
+            }
+            QPushButton:disabled {
+                background: rgba(213, 91, 145, 0.42);
+                border: 1px solid rgba(238, 172, 200, 0.45);
+                color: rgba(255, 255, 255, 0.76);
+            }
+            """
+        )
 
     def accept(self) -> None:
         settings = self._validated_settings()
