@@ -52,9 +52,11 @@ WINDOWS_BROWSER_PAGE_CONFLICT_TOOL_NAMES = {
     "windows__Scroll",
     "windows__Move",
 }
+BROWSER_NAVIGATE_TOOL_NAME = "browser__browser_navigate"
+BROWSER_SNAPSHOT_TOOL_NAME = "browser__browser_snapshot"
 BROWSER_DOM_TOOL_NAMES = {
-    "browser__browser_navigate",
-    "browser__browser_snapshot",
+    BROWSER_NAVIGATE_TOOL_NAME,
+    BROWSER_SNAPSHOT_TOOL_NAME,
     "browser__browser_click",
     "browser__browser_type",
     "browser__browser_wait_for",
@@ -252,6 +254,7 @@ class AgentRuntime:
             step_results: list[ToolExecutionResult] = []
             pending_actions: list[PendingToolAction] = []
             tools_started_at = time.perf_counter()
+            should_fast_forward_final_reply = False
             allowed_calls = min(
                 len(tool_calls),
                 MAX_TOOL_CALLS_PER_STEP,
@@ -374,6 +377,30 @@ class AgentRuntime:
                     )
                 )
 
+            if (
+                not pending_actions
+                and total_tool_calls < MAX_TOOL_CALLS_PER_TURN
+                and _should_auto_snapshot_after_browser_navigation(
+                    tool_calls,
+                    step_results,
+                    self.tools,
+                )
+            ):
+                total_tool_calls += 1
+                snapshot_result = _execute_auto_browser_snapshot(self.tools, step_index)
+                step_results.append(snapshot_result)
+                execution_results.append(snapshot_result)
+                emitted_actions.append(
+                    AgentAction(
+                        type="tool_call",
+                        payload=_redact_tool_result_for_model(snapshot_result),
+                    )
+                )
+                should_fast_forward_final_reply = _should_fast_forward_after_auto_browser_snapshot(
+                    working_messages,
+                    snapshot_result,
+                )
+
             if pending_actions:
                 debug_log(
                     "AgentRuntime",
@@ -411,6 +438,17 @@ class AgentRuntime:
                     ),
                 ]
             )
+            if should_fast_forward_final_reply:
+                debug_log(
+                    "AgentRuntime",
+                    "自动浏览器快照后直接进入最终总结",
+                    {
+                        "step_index": step_index,
+                        "tool_result_count": len(execution_results),
+                        "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
+                    },
+                )
+                break
             if total_tool_calls >= MAX_TOOL_CALLS_PER_TURN:
                 break
 
@@ -928,6 +966,210 @@ def _should_block_background_web_tool_for_visible_browser(
     if not visible_browser_mode:
         return False
     return str(call.get("name", "")) in WEB_BACKGROUND_TOOL_NAMES
+
+
+def _should_auto_snapshot_after_browser_navigation(
+    tool_calls: list[dict[str, Any]],
+    step_results: list[ToolExecutionResult],
+    tools: ToolRegistry,
+) -> bool:
+    """浏览器导航成功后自动补一次只读页面快照，减少固定流程的模型往返。"""
+    if tools.get(BROWSER_SNAPSHOT_TOOL_NAME) is None:
+        return False
+    if any(call.get("name") == BROWSER_SNAPSHOT_TOOL_NAME for call in tool_calls):
+        return False
+    return any(
+        result.tool_name == BROWSER_NAVIGATE_TOOL_NAME and result.success
+        for result in step_results
+    )
+
+
+def _execute_auto_browser_snapshot(tools: ToolRegistry, step_index: int) -> ToolExecutionResult:
+    arguments = {"depth": 3}
+    reason = "浏览器导航成功后自动读取页面内容，减少模型往返。"
+    debug_log(
+        "AgentRuntime",
+        "自动补充浏览器页面快照",
+        {
+            "step_index": step_index,
+            "name": BROWSER_SNAPSHOT_TOOL_NAME,
+            "arguments": arguments,
+            "reason": reason,
+        },
+    )
+    prepared = tools.prepare_or_execute(BROWSER_SNAPSHOT_TOOL_NAME, arguments, reason)
+    if isinstance(prepared, PendingToolAction):
+        result = ToolExecutionResult(
+            tool_name="runtime",
+            success=False,
+            content={
+                "auto_tool": BROWSER_SNAPSHOT_TOOL_NAME,
+                "reason": "自动页面快照需要用户确认，已跳过隐藏执行。",
+            },
+            error="自动页面快照需要用户确认，已跳过。",
+        )
+        debug_log("AgentRuntime", "自动浏览器页面快照需要确认，已跳过", result.to_dict())
+        return result
+
+    debug_log("AgentRuntime", "自动浏览器页面快照完成", _redact_tool_result_for_model(prepared))
+    return prepared
+
+
+def _should_fast_forward_after_auto_browser_snapshot(
+    messages: list[ChatMessage],
+    snapshot_result: ToolExecutionResult,
+) -> bool:
+    if not _latest_user_is_browser_lookup_request(messages):
+        return False
+    if _latest_user_is_browser_interaction_request(messages):
+        return False
+    return _browser_snapshot_has_readable_content(snapshot_result)
+
+
+def _latest_user_is_browser_lookup_request(messages: list[ChatMessage]) -> bool:
+    text = (_latest_user_text(messages) or "").lower()
+    if not text:
+        return False
+    lookup_keywords = (
+        "搜索",
+        "搜一下",
+        "搜一搜",
+        "查",
+        "查询",
+        "看看",
+        "看一下",
+        "百科",
+        "信息",
+        "资料",
+        "介绍",
+        "告诉我",
+        "说明",
+        "内容",
+        "总结",
+        "梳理",
+        "是谁",
+        "是什么",
+        "検索",
+        "調べ",
+        "情報",
+        "教えて",
+        "紹介",
+        "search",
+        "look up",
+        "lookup",
+        "information",
+        "info",
+        "tell me",
+        "wiki",
+        "wikipedia",
+        "summary",
+        "summarize",
+    )
+    return any(keyword in text for keyword in lookup_keywords)
+
+
+def _latest_user_is_browser_interaction_request(messages: list[ChatMessage]) -> bool:
+    text = (_latest_user_text(messages) or "").lower()
+    if not text:
+        return False
+    interaction_keywords = (
+        "点击",
+        "点开",
+        "点进",
+        "输入",
+        "填写",
+        "登录",
+        "登陆",
+        "提交",
+        "下载",
+        "滚动",
+        "选择",
+        "勾选",
+        "购买",
+        "支付",
+        "播放",
+        "打开菜单",
+        "切换",
+        "上传",
+        "发帖",
+        "评论",
+        "回复",
+        "删除",
+        "编辑",
+        "下一页",
+        "上一页",
+        "クリック",
+        "入力",
+        "ログイン",
+        "送信",
+        "ダウンロード",
+        "スクロール",
+        "選択",
+        "click",
+        "type",
+        "login",
+        "log in",
+        "submit",
+        "download",
+        "scroll",
+        "select",
+        "choose",
+        "upload",
+    )
+    return any(keyword in text for keyword in interaction_keywords)
+
+
+def _browser_snapshot_has_readable_content(result: ToolExecutionResult) -> bool:
+    if result.tool_name != BROWSER_SNAPSHOT_TOOL_NAME or not result.success:
+        return False
+    text = _tool_result_content_text(result.content).strip()
+    if len(text) < 20:
+        return False
+    normalized = text.lower()
+    if _browser_snapshot_looks_like_search_results(normalized):
+        return False
+    blocked_markers = (
+        "error executing tool",
+        "http 403",
+        "forbidden",
+        "timeout",
+        '"is_error": true',
+        "'is_error': true",
+        '"loading": true',
+        "'loading': true",
+        "加载失败",
+        "访问被拒绝",
+        "无法访问",
+    )
+    return not any(marker in normalized for marker in blocked_markers)
+
+
+def _browser_snapshot_looks_like_search_results(normalized_text: str) -> bool:
+    search_page_markers = (
+        "google.com/search",
+        "bing.com/search",
+        "baidu.com/s?",
+        "duckduckgo.com/",
+        "search.yahoo.com/search",
+        "sogou.com/web",
+        "yandex.com/search",
+        "google 搜索",
+        "google search",
+        "bing search",
+        "百度一下",
+        "搜索结果",
+        "search results",
+    )
+    return any(marker in normalized_text for marker in search_page_markers)
+
+
+def _tool_result_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(content)
 
 
 def _build_browser_page_windows_tool_block_result(call: dict[str, Any]) -> ToolExecutionResult:

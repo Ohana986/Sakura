@@ -1108,6 +1108,354 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
     assert "不要先打开搜索首页再操作输入框" in client.prompt
 
 
+def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> None:
+    class BrowserLookupClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+            self.chat_called = False
+            self.chat_messages: list[dict[str, object]] = []
+
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            return (
+                '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开看看。","tone":"中性"}]},'
+                '"tool_calls":[{"name":"browser__browser_navigate",'
+                '"arguments":{"url":"https://zh.moegirl.org.cn/二阶堂真红"},'
+                '"reason":"打开目标百科页面"}]}'
+            )
+
+        def chat(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.chat_called = True
+            self.chat_messages = messages
+            from app.chat_reply import parse_chat_reply
+
+            return parse_chat_reply(
+                '{"segments":[{"ja":"確認できたよ。","zh":"已经确认页面内容了。","tone":"中性"}]}'
+            )
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda arguments: {"url": arguments["url"], "title": "二阶堂真红"},
+            ),
+            Tool(
+                name="browser__browser_snapshot",
+                description="浏览器页面快照",
+                handler=lambda arguments: {
+                    "depth": arguments["depth"],
+                    "text": "二阶堂真红是《五彩斑斓的世界》系列的女主角，页面包含角色信息。",
+                },
+            ),
+        ]
+    )
+    client = BrowserLookupClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "打开浏览器搜索一下二阶堂真红的萌娘百科，告诉我她的信息"}]
+    )
+
+    assert result.reply.translation == "已经确认页面内容了。"
+    assert [action.payload["tool_name"] for action in result.actions] == [
+        "browser__browser_navigate",
+        "browser__browser_snapshot",
+    ]
+    assert client.raw_calls == 1
+    assert client.chat_called
+    assert "二阶堂真红是《五彩斑斓的世界》系列的女主角" in str(client.chat_messages)
+
+
+def test_browser_navigate_does_not_duplicate_planned_snapshot() -> None:
+    class BrowserSnapshotClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            if self.raw_calls == 1:
+                return (
+                    '{"reply":{"segments":[{"ja":"確認するね。","zh":"我确认一下。","tone":"中性"}]},'
+                    '"tool_calls":['
+                    '{"name":"browser__browser_navigate","arguments":{"url":"https://example.com"},"reason":"打开页面"},'
+                    '{"name":"browser__browser_snapshot","arguments":{"depth":2},"reason":"读取页面"}'
+                    "]} "
+                )
+            return (
+                '{"reply":{"segments":[{"ja":"読めたよ。","zh":"读到了。","tone":"中性"}]},'
+                '"tool_calls":[]}'
+            )
+
+    snapshot_calls: list[dict[str, object]] = []
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda _arguments: {"url": "https://example.com"},
+            ),
+            Tool(
+                name="browser__browser_snapshot",
+                description="浏览器页面快照",
+                handler=lambda arguments: snapshot_calls.append(arguments) or {"text": "Example Page"},
+            ),
+        ]
+    )
+    client = BrowserSnapshotClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "打开浏览器看一下这个页面"}])
+
+    assert result.reply.translation == "读到了。"
+    assert [action.payload["tool_name"] for action in result.actions] == [
+        "browser__browser_navigate",
+        "browser__browser_snapshot",
+    ]
+    assert snapshot_calls == [{"depth": 2}]
+    assert client.raw_calls == 2
+
+
+def test_browser_navigate_failure_does_not_auto_snapshot() -> None:
+    class BrowserFailureClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            if self.raw_calls == 1:
+                return (
+                    '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"arguments":{"url":"https://example.invalid"},"reason":"打开页面"}]}'
+                )
+            return (
+                '{"reply":{"segments":[{"ja":"開けなかった。","zh":"页面没打开。","tone":"困惑"}]},'
+                '"tool_calls":[]}'
+            )
+
+    snapshot_called = False
+
+    def snapshot(_arguments):  # type: ignore[no-untyped-def]
+        nonlocal snapshot_called
+        snapshot_called = True
+        return {"text": "不应读取"}
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda _arguments: (_ for _ in ()).throw(RuntimeError("导航失败")),
+            ),
+            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=snapshot),
+        ]
+    )
+    client = BrowserFailureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "打开浏览器查一下页面信息"}])
+
+    assert result.reply.translation == "页面没打开。"
+    assert [action.payload["tool_name"] for action in result.actions] == ["browser__browser_navigate"]
+    assert not snapshot_called
+    assert client.raw_calls == 2
+
+
+def test_browser_interaction_request_auto_snapshots_without_fast_forward() -> None:
+    class BrowserInteractionClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+            self.chat_called = False
+            self.messages: list[list[dict[str, object]]] = []
+
+        def complete_raw(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            self.messages.append(messages)
+            if self.raw_calls == 1:
+                return (
+                    '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"arguments":{"url":"https://example.com/login"},"reason":"打开登录页"}]}'
+                )
+            assert "browser__browser_snapshot" in str(messages)
+            return (
+                '{"reply":{"segments":[{"ja":"次の操作を確認したよ。","zh":"我确认下一步操作了。","tone":"中性"}]},'
+                '"tool_calls":[]}'
+            )
+
+        def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.chat_called = True
+            from app.chat_reply import parse_chat_reply
+
+            return parse_chat_reply(
+                '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
+            )
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda arguments: {"url": arguments["url"]},
+            ),
+            Tool(
+                name="browser__browser_snapshot",
+                description="浏览器页面快照",
+                handler=lambda _arguments: {"text": "Login Page 用户名 密码 登录按钮"},
+            ),
+        ]
+    )
+    client = BrowserInteractionClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "打开这个页面并点击登录按钮"}])
+
+    assert result.reply.translation == "我确认下一步操作了。"
+    assert [action.payload["tool_name"] for action in result.actions] == [
+        "browser__browser_navigate",
+        "browser__browser_snapshot",
+    ]
+    assert client.raw_calls == 2
+    assert not client.chat_called
+
+
+def test_browser_lookup_does_not_fast_forward_when_auto_snapshot_has_no_content() -> None:
+    class EmptySnapshotClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+            self.chat_called = False
+
+        def complete_raw(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            if self.raw_calls == 1:
+                return (
+                    '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"arguments":{"url":"https://example.com"},"reason":"打开页面"}]}'
+                )
+            assert "browser__browser_snapshot" in str(messages)
+            return (
+                '{"reply":{"segments":[{"ja":"もう少し確認するね。","zh":"我再确认一下。","tone":"中性"}]},'
+                '"tool_calls":[]}'
+            )
+
+        def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.chat_called = True
+            from app.chat_reply import parse_chat_reply
+
+            return parse_chat_reply(
+                '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
+            )
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda arguments: {"url": arguments["url"]},
+            ),
+            Tool(
+                name="browser__browser_snapshot",
+                description="浏览器页面快照",
+                handler=lambda _arguments: {"text": ""},
+            ),
+        ]
+    )
+    client = EmptySnapshotClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "打开浏览器查一下页面信息"}])
+
+    assert result.reply.translation == "我再确认一下。"
+    assert client.raw_calls == 2
+    assert not client.chat_called
+
+
+def test_browser_lookup_does_not_fast_forward_on_search_results_page() -> None:
+    class SearchResultsClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+            self.chat_called = False
+
+        def complete_raw(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            if self.raw_calls == 1:
+                return (
+                    '{"reply":{"segments":[{"ja":"検索するね。","zh":"我搜索一下。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"arguments":{"url":"https://www.google.com/search?q=二階堂真紅+百科"},'
+                    '"reason":"打开搜索结果"}]}'
+                )
+            assert "google.com/search" in str(messages)
+            return (
+                '{"reply":{"segments":[{"ja":"結果をもう少し見るね。","zh":"我再看一下搜索结果。","tone":"中性"}]},'
+                '"tool_calls":[]}'
+            )
+
+        def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.chat_called = True
+            from app.chat_reply import parse_chat_reply
+
+            return parse_chat_reply(
+                '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
+            )
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开浏览器页面",
+                handler=lambda arguments: {"url": arguments["url"]},
+            ),
+            Tool(
+                name="browser__browser_snapshot",
+                description="浏览器页面快照",
+                handler=lambda _arguments: {
+                    "text": (
+                        "### Page\n"
+                        "- Page URL: https://www.google.com/search?q=二階堂真紅+百科\n"
+                        "- Page Title: 二階堂真紅 百科 - Google Search\n"
+                        "搜索结果包含若干链接。"
+                    )
+                },
+            ),
+        ]
+    )
+    client = SearchResultsClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "打开浏览器查查二阶堂真红的百科"}])
+
+    assert result.reply.translation == "我再看一下搜索结果。"
+    assert client.raw_calls == 2
+    assert not client.chat_called
+
+
 def test_visible_browser_request_blocks_background_search_and_continues_planning() -> None:
     class MisroutedSearchClient:
         def __init__(self) -> None:
