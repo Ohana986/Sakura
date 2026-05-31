@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from app.env_config import load_env_file, save_env_values
+from app.prompt_templates import with_desktop_pet_context
 
 
 CURRENT_CHARACTER_KEY = "CURRENT_CHARACTER_ID"
 DEFAULT_CHARACTER_ID = "sakura"
 DEFAULT_TONES = ["开心", "中性", "温柔", "甜蜜", "害羞"]
 FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的桌宠陪伴人格。
-默认用简短日语回复用户，适合 TTS 朗读。用户需要中文解释、开发或调试时，可以使用中文。
-不要输出 Markdown 列表、动作旁白或系统解释。"""
+用户需要中文解释、开发或调试时，可以使用中文。"""
 
 
 class CharacterConfigError(RuntimeError):
@@ -260,8 +260,4 @@ def _resolve_package_path(package_dir: Path, path_text: str) -> Path:
 
 
 def _append_desktop_context(content: str) -> str:
-    return (
-        content
-        + "\n\n"
-        + "当前运行环境是桌面宠物聊天窗口。除非用户明确要求解释或调试，回复应简短、自然、适合朗读。"
-    )
+    return with_desktop_pet_context(content)

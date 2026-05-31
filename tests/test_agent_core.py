@@ -891,8 +891,43 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
     result = runtime.handle_user_message([{"role": "user", "content": "你觉得我现在是不是卡住了？"}])
 
     assert "observe_screen" in client.prompts[0]
+    assert "主动获取上下文策略" in client.prompts[0]
+    assert "用户输入很短、模糊、寒暄、状态化" in client.prompts[0]
+    assert "优先调用 observe_screen 获取当前屏幕" in client.prompts[0]
     assert result.actions
     assert result.actions[0].type == SCREEN_OBSERVATION_REQUEST_ACTION
+
+
+def test_tool_planning_prompt_encourages_web_search_for_uncertain_external_info() -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"確認するね。","zh":"我来确认一下。","tone":"中性"}]}}'
+
+    client = PromptCaptureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry(
+            [
+                Tool(
+                    name="web__web_search",
+                    description="搜索公开网页，并返回标题、链接和简短摘要。",
+                    handler=lambda arguments: {"results": []},
+                )
+            ]
+        ),
+    )
+
+    runtime.handle_user_message([{"role": "user", "content": "这个库现在最新版本是多少？"}])
+
+    assert "web__web_search" in client.prompts[0]
+    assert "最新、外部、公开或不确定的信息" in client.prompts[0]
+    assert "主动使用可用的网页搜索工具" in client.prompts[0]
+    assert "搜索摘要不足以回答时，再读取具体网页" in client.prompts[0]
 
 
 def test_autonomous_screen_observation_disabled_hides_screen_tool() -> None:
@@ -914,6 +949,7 @@ def test_autonomous_screen_observation_disabled_hides_screen_tool() -> None:
     runtime.handle_user_message([{"role": "user", "content": "你觉得我现在是不是卡住了？"}])
 
     assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
+    assert "当前没有可用的自主屏幕观察工具" in client.prompts[0]
 
 
 def test_model_vision_disabled_hides_screen_observation_tool() -> None:
@@ -1107,10 +1143,9 @@ def test_proactive_check_event_generates_segmented_reply() -> None:
     )
 
     assert "低打扰主动搭话" in client.prompts[0]
-    assert "主动搭话不是关怀模板" in client.prompts[0]
     assert "只表示用户一段时间没有和桌宠交互" in client.prompts[0]
-    assert "不代表用户离开" in client.prompts[0]
-    assert "不要根据 seconds_since_pet_interaction 说“没动静”" in client.prompts[0]
+    assert "不要据此推断用户离开" in client.prompts[0]
+    assert "真实可见或已知的具体内容" in client.prompts[0]
     assert "自然搭话、提问或提醒用户" in client.prompts[0]
     assert "tone 和 portrait 要根据内容选择" in client.prompts[0]
     assert "自然搭话" in str(client.messages[0][0]["content"])
@@ -1160,9 +1195,10 @@ def test_proactive_check_event_attaches_screen_context_image() -> None:
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,abc123"
     assert "abc123" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
-    assert "优先理解屏幕画面本身" in client.prompts[0]
-    assert "找到屏幕话题时，不要在结尾追加" in client.prompts[0]
-    assert "轻微吃醋" in client.prompts[0]
+    assert "先理解屏幕画面本身" in client.prompts[0]
+    assert "自然评论、提问或轻提醒" in client.prompts[0]
+    assert "不要编造看不清" in client.prompts[0]
+    assert "不要再请求 observe_screen" in client.prompts[0]
     assert "主动搭话时不要固定使用“提醒”语气" in client.prompts[0]
     assert "自然搭话" in content[0]["text"]
 

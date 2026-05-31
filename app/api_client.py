@@ -14,6 +14,7 @@ from typing import Any
 from app.chat_reply import ChatReply, parse_chat_reply
 from app.debug_log import debug_log, summarize_messages
 from app.env_config import load_env_file, save_env_values
+from app.prompt_templates import build_segmented_reply_instruction
 
 
 MAX_API_RETRY_ATTEMPTS = 3
@@ -31,28 +32,6 @@ SUPPORTED_CHAT_COMPLETION_PARAMS = {
     "tools",
     "tool_choice",
 }
-
-SEGMENTED_REPLY_INSTRUCTION_TEMPLATE = """
-你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
-JSON 格式如下：
-{"segments":[{"ja":"日文原文","zh":"中文译文","tone":"中性","portrait":"站立待机"}]}
-
-分段规则：
-- 尽量输出 3-4 段文本，每段是一条可以单独显示的完整小消息，不要把一句话机械切碎。
-- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。
-- 如果用户只问很简单的问题，可以只输出 2-3 段。
-- 需要对每段文本的语气进行标注，语气标签放在 tone 字段中。优先选择中性,除非文本明显带有其他语气；如果文本中同时包含多种语气，请选择最突出的一种。
-- tone 只能从这些类别中选择：{tones}。
-- 需要对每段文本选择一张立绘，立绘名称放在 portrait 字段中。
-- portrait 只能从这些类别中选择：{portraits}。
-- ja 中只写夜乃桜要说出口的日文原文，必须是日语，适合直接交给日语 TTS 朗读。
-- ja 中不要有任何非日语内容，如果出现例如中文引用, 把引用的中文内容翻译成日文放在 ja 字段里；
-- ja 中不要有英文单词，如果日文中夹杂着英文名词之类的，请使用片假名的拼写来替换原英文单词。
-- zh 中只写 ja 对应的自然中文译文，必须是中文，不要添加解释、括号动作、语气标签或额外内容。
-- 无论用户使用什么语言，ja 和 zh 都必须同时输出；不要只输出其中一种语言。
-- ja 和 zh 必须一一对应；不要为了翻译改变 ja 的角色语气或内容。
-"""
-
 
 class ApiConfigError(RuntimeError):
     """API 配置缺失或格式错误。"""
@@ -361,17 +340,7 @@ def _build_segmented_reply_instruction(
     reply_tones: list[str] | None,
     reply_portraits: list[str] | None = None,
 ) -> str:
-    tones = [tone.strip() for tone in reply_tones or [] if tone.strip()]
-    if not tones:
-        tones = ["开心", "中性", "温柔", "甜蜜", "害羞"]
-    portraits = [portrait.strip() for portrait in reply_portraits or [] if portrait.strip()]
-    if not portraits:
-        portraits = ["站立待机"]
-    return (
-        SEGMENTED_REPLY_INSTRUCTION_TEMPLATE.strip()
-        .replace("{tones}", "、".join(tones))
-        .replace("{portraits}", "、".join(portraits))
-    )
+    return build_segmented_reply_instruction(reply_tones, reply_portraits)
 
 
 def _build_chat_completion_payload(

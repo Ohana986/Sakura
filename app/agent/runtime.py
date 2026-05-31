@@ -23,6 +23,12 @@ from app.api_client import (
 )
 from app.chat_reply import ChatReply, parse_chat_reply
 from app.debug_log import debug_log, summarize_messages
+from app.prompt_templates import (
+    build_agent_reply_protocol,
+    build_context_acquisition_strategy,
+    build_event_reply_protocol,
+    build_proactive_rules,
+)
 
 
 MAX_AGENT_STEPS_PER_TURN = 4
@@ -462,20 +468,16 @@ class AgentRuntime:
             ensure_ascii=False,
             indent=2,
         )
-        tones = "、".join(tone for tone in self.reply_tones if tone.strip()) or "中性"
-        portraits = "、".join(portrait for portrait in self.reply_portraits if portrait.strip()) or "站立待机"
         memory_summary = self._memory_summary()
         current_time = datetime.now().astimezone().isoformat(timespec="seconds")
-        screen_observation_instruction = (
-            "- observe_screen 是你的自主视觉感知工具；当你想确认主人当前窗口、屏幕内容、正在做什么、是否卡住，或需要具体画面话题时，可以主动调用。文字信息已经足够时不要截图。"
-            if allow_screen_observation
-            else "- 当前没有可用的自主屏幕观察工具；不要请求截图，也不要臆造当前屏幕内容。"
+        reply_protocol = build_agent_reply_protocol(self.reply_tones, self.reply_portraits)
+        context_strategy = build_context_acquisition_strategy(
+            allow_screen_observation=allow_screen_observation
         )
         return f"""
 {self.system_prompt.strip()}
 
 你现在可以作为桌面陪伴型 Agent 判断是否需要调用内部工具。
-你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
 如果需要工具，返回 reply 和 tool_calls；如果不需要工具，tool_calls 返回空数组或省略。
 
 长期记忆摘要：
@@ -493,36 +495,16 @@ class AgentRuntime:
 可用工具：
 {tool_descriptions}
 
-返回格式：
-{{
-  "reply": {{
-    "segments": [
-      {{"ja": "日文原文", "zh": "中文译文", "tone": "中性", "portrait": "站立待机"}}
-    ]
-  }},
-  "tool_calls": [
-    {{"name": "工具名", "arguments": {{}}, "reason": "为什么需要这个工具"}}
-  ]
-}}
+{reply_protocol}
 
-分段规则：
-- 尽量输出 2-4 段文本，每段是一条可以单独显示和朗读的完整小消息，不要把一句话机械切碎。
-- 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。
-- 用户问题包含多个要点、步骤、原因或较长说明时，优先输出 3-4 段，让桌宠可以逐段显示和朗读。
-- 如果用户只问很简单的问题，可以只输出 1-2 段。
-- 不要因为返回格式示例里只写了一条 segment，就把完整回复固定成一段。
+{context_strategy}
 
-要求：
-- tone 只能从这些类别中选择：{tones}。
-- portrait 只能从这些类别中选择：{portraits}。
-- ja 中只写夜乃桜要说出口的日文原文，必须是日语，适合直接交给日语 TTS 朗读。
-- zh 中只写 ja 对应的自然中文译文，必须是中文。
+工具要求：
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
 - requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
 - 需要读取网页内容时，优先使用 browser_get_content；需要打开网页时使用 browser_open_url。
 - 需要网页交互时，只能基于当前页面真实内容选择 browser_scroll 或 browser_click，不要臆造 selector 或页面内容。
-{screen_observation_instruction}
 {extra_instructions.strip()}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
@@ -538,44 +520,21 @@ class AgentRuntime:
 """.strip()
 
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
-        tones = "、".join(tone for tone in self.reply_tones if tone.strip()) or "中性"
-        portraits = "、".join(portrait for portrait in self.reply_portraits if portrait.strip()) or "站立待机"
         proactive_rules = ""
         example_tone = "提醒"
         if event_type == "proactive_check":
             example_tone = "中性"
-            proactive_rules = """
-- 这是低打扰主动搭话，不是用户主动提问；如果没有明确问题，只说 1-2 段即可。
-- 主动搭话不是关怀模板，也不是固定的护眼提醒。先判断事件里是否附加了 screen_context.image_attached 或 screen_contexts；如果有，优先理解屏幕画面本身，再决定要聊什么。
-- 如果事件附加了多张 screen_contexts，它们表示一段时间内按顺序捕获的屏幕画面；概括这段时间的活动趋势，不要逐张机械描述，也不要把推测说成确定事实。
-- seconds_since_pet_interaction 只表示用户一段时间没有和桌宠交互，不代表用户离开、电脑没操作、屏幕没变化或没有活动。
-- 不要根据 seconds_since_pet_interaction 说“没动静”“去哪了”“消失了”“是不是离开了”等判断；它只能作为降低打扰频率的背景信息。
-- 如果能看出屏幕内容，请围绕用户正在看的具体内容自然接话：可以点出界面类型、正在处理的任务、明显的报错/搜索/文档/代码/设置/聊天/视频/音乐/角色内容，并提出一个具体、轻量的问题或评论。
-- 找到屏幕话题时，不要在结尾追加“看远处、深呼吸、休息、喝水、别逞强、别硬扛”等通用关怀句；这些会显得机械。
-- 只有在没有可聊内容、屏幕无法判断、或画面明确显示用户疲惫/超长时间工作时，才使用休息、喝水或伸展类提醒。
-- 如果看到代码、终端、报错、搜索故障或明显卡住，优先问一个针对当前问题的具体问题，例如“这段是在调哪个异常？”“要不要我帮你把日志里的关键线索拎出来？”。
-- 如果看到文档、笔记、写作或资料页，可以问是否卡在某段、要不要帮忙梳理要点、润色或继续推进。
-- 如果看到设置页、表单、工具界面或对话框，可以问是否需要确认当前选项、排查某个状态或比较可选项。
-- 如果看到视频、音乐、游戏、图片、角色或二次元女孩子，可以自然评价内容；若符合夜乃桜的人格，可以轻微吃醋、嘴硬、装作不在意或问“你喜欢这种类型吗”，但不要责备用户。
-- 如果像是在娱乐，不要批评；优先找画面里的内容聊天，而不是提醒时间。
-- 如果屏幕内容无法判断，或没有附加屏幕图片，不要臆造，只做一句很轻的普通问候。
-- 提问要具体，避免只说“要不要帮忙”这种泛泛关怀；但不要编造屏幕上看不清的文字、文件名、错误码或用户意图。
-- 只能给建议或询问，不要声明自己已经执行任何工具、点击、打开网页或改变外部状态。
-""".rstrip()
+            proactive_rules = build_proactive_rules()
+        reply_protocol = build_event_reply_protocol(
+            self.reply_tones,
+            self.reply_portraits,
+            example_tone=example_tone,
+        )
         return f"""
 {self.system_prompt.strip()}
 
 你正在处理 Sakura 桌宠的主动事件。请用角色语气自然搭话、提问或提醒用户。
-你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
-JSON 格式如下：
-{{"segments":[{{"ja":"日文原文","zh":"中文译文","tone":"{example_tone}","portrait":"站立待机"}}]}}
-
-要求：
-- tone 只能从这些类别中选择：{tones}。
-- portrait 只能从这些类别中选择：{portraits}。
-- ja 中只写夜乃桜要说出口的日文原文，必须是日语，适合直接交给日语 TTS 朗读。
-- zh 中只写 ja 对应的自然中文译文，必须是中文。
-- tone 和 portrait 要根据内容选择；主动搭话时不要固定使用“提醒”语气。
+{reply_protocol}
 - 不要提及内部事件类型、JSON 或工具实现。
 {proactive_rules}
 """.strip()
@@ -1022,23 +981,10 @@ def _build_proactive_vision_unsupported_reply() -> ChatReply:
 
 
 def _build_proactive_tool_loop_rules() -> str:
-    return """
-- 这是主动检查事件，不是用户直接发来的请求；整体保持低打扰。
-- 这是低打扰主动搭话，不是用户主动提问；如果没有明确问题，只说 1-2 段即可。
-- 请用角色语气自然搭话、提问或提醒用户。
-- 主动搭话不是关怀模板，也不是固定的护眼提醒。
-- seconds_since_pet_interaction 只表示用户一段时间没有和桌宠交互，不代表用户离开、电脑没操作、屏幕没变化或没有活动。
-- 不要根据 seconds_since_pet_interaction 说“没动静”“去哪了”“消失了”“是不是离开了”等判断；它只能作为降低打扰频率的背景信息。
-- 如果能看出屏幕内容，请围绕用户正在看的具体内容自然接话，并提出一个具体、轻量的问题或评论。
-- 如果事件里附加了 screen_context.image_attached 或 screen_contexts，优先理解屏幕画面本身，再决定要聊什么。
-- 如果事件附加了多张 screen_contexts，它们表示一段时间内按顺序捕获的屏幕画面；概括这段时间的活动趋势，不要逐张机械描述，也不要把推测说成确定事实。
-- 找到屏幕话题时，不要在结尾追加“看远处、深呼吸、休息、喝水、别逞强、别硬扛”等通用关怀句；这些会显得机械。
-- 如果看到视频、音乐、游戏、图片、角色或二次元女孩子，可以自然评价内容；若符合夜乃桜的人格，可以轻微吃醋、嘴硬、装作不在意或问“你喜欢这种类型吗”，但不要责备用户。
-- tone 和 portrait 要根据内容选择；主动搭话时不要固定使用“提醒”语气。
-- 你可以使用只读或低风险工具补充上下文，例如读取当前时间、搜索已确认记忆、读取受控浏览器当前内容或状态。
-- 如果可用工具里出现 observe_screen，你也可以因为想看看主人现在在做什么而主动观察屏幕；但同一事件已经有 screen_context.image_attached 或 screen_contexts 时不要再截图。
-- 只有发现明确、有价值的后续线索时才继续下一步；不要为了显得主动而循环调用工具。
-- 不要主动执行会改变外部状态的工具，除非工具需要确认且你只是发起确认请求。
-- 如果事件已经附加 screen_context.image_attached 或 screen_contexts，优先基于画面判断；不要再请求 observe_screen。
-- 最终回复只说给用户听的自然搭话、提问或轻提醒，不要提及内部事件、工具循环或工具协议。
-""".strip()
+    return "\n".join(
+        [
+            "- 这是主动检查事件，不是用户直接发来的请求；整体保持低打扰。",
+            "- 请用角色语气自然搭话、提问或提醒用户。",
+            build_proactive_rules(include_tool_rules=True),
+        ]
+    )
