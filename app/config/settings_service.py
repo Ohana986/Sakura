@@ -9,7 +9,14 @@ from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, 
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
 from app.agent.proactive_care import ProactiveCareSettings
-from app.voice.tts import GPTSoVITSTTSSettings
+from app.voice.tts import (
+    DEFAULT_GENIE_TTS_API_URL,
+    DEFAULT_GPT_SOVITS_API_URL,
+    TTS_PROVIDER_GENIE,
+    TTS_PROVIDER_GPT_SOVITS,
+    TTS_PROVIDER_NONE,
+    GPTSoVITSTTSSettings,
+)
 
 
 API_CONFIG_FILE = "api.yaml"
@@ -78,25 +85,40 @@ class AppSettingsService:
     ) -> GPTSoVITSTTSSettings:
         data = self._api_section("tts")
         gpt_sovits = _mapping(data.get("gpt_sovits"))
+        genie_tts = _mapping(data.get("genie_tts"))
         provider = str(data.get("provider", "")).strip().lower()
         enabled = _bool_value(data.get("enabled"), False)
         if provider in {"none", "off", "disabled", "不使用"}:
             enabled = False
+            provider = TTS_PROVIDER_NONE
         elif provider in {"gpt-sovits", "gpt_sovits", "gptsovits"}:
             enabled = True
-        api_url = str(gpt_sovits.get("api_url", "http://127.0.0.1:9880/tts")).strip()
-        ref_lang = str(gpt_sovits.get("ref_lang", "ja")).strip()
-        text_lang = str(gpt_sovits.get("text_lang", "ja")).strip()
-        timeout_seconds = _int_value(gpt_sovits.get("timeout_seconds"), 60)
+            provider = TTS_PROVIDER_GPT_SOVITS
+        elif provider in {"genie", "genie-tts", "genie_tts"}:
+            enabled = True
+            provider = TTS_PROVIDER_GENIE
+        else:
+            provider = TTS_PROVIDER_GPT_SOVITS if enabled else TTS_PROVIDER_NONE
+
+        provider_data = genie_tts if provider == TTS_PROVIDER_GENIE else gpt_sovits
+        default_api_url = DEFAULT_GENIE_TTS_API_URL if provider == TTS_PROVIDER_GENIE else DEFAULT_GPT_SOVITS_API_URL
+        api_url = str(provider_data.get("api_url", default_api_url)).strip()
+        work_dir = _optional_path(provider_data.get("work_dir"), self.base_dir)
+        ref_lang = str(provider_data.get("ref_lang", gpt_sovits.get("ref_lang", "ja"))).strip()
+        text_lang = str(provider_data.get("text_lang", gpt_sovits.get("text_lang", "ja"))).strip()
+        timeout_seconds = _int_value(provider_data.get("timeout_seconds"), 60)
+        onnx_model_dir = _optional_path(genie_tts.get("onnx_model_dir"), self.base_dir)
         if character_profile is not None:
+            if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
+                onnx_model_dir = self.base_dir / "data" / "tts_bundles" / "onnx" / character_profile.id
             ref_lang = str(
-                gpt_sovits.get(
+                provider_data.get(
                     "ref_lang",
                     character_profile.voice.ref_lang if character_profile.voice is not None else ref_lang,
                 )
             ).strip()
             text_lang = str(
-                gpt_sovits.get(
+                provider_data.get(
                     "text_lang",
                     character_profile.voice.text_lang if character_profile.voice is not None else text_lang,
                 )
@@ -108,15 +130,24 @@ class AppSettingsService:
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
+                provider=provider,
+                work_dir=work_dir,
+                onnx_model_dir=onnx_model_dir,
                 validate_enabled=validate_enabled,
             )
         else:
+            if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
+                onnx_model_dir = self.base_dir / "data" / "tts_bundles" / "onnx" / "default"
             settings = GPTSoVITSTTSSettings(
                 enabled=enabled,
                 api_url=api_url,
                 ref_audio_path=self.base_dir / "ref" / "VO01_2210.ogg",
                 ref_text_path=self.base_dir / "ref" / "text.txt",
                 ref_text="",
+                provider=provider,
+                work_dir=work_dir,
+                character_name="sakura",
+                onnx_model_dir=onnx_model_dir,
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
@@ -127,16 +158,30 @@ class AppSettingsService:
 
     def save_tts_settings(self, settings: GPTSoVITSTTSSettings) -> None:
         data = load_yaml_mapping(self.api_config_path)
-        data["tts"] = {
-            "provider": "gpt-sovits" if settings.enabled else "none",
+        saved_provider = settings.provider if settings.enabled else TTS_PROVIDER_NONE
+        section_provider = settings.provider if settings.provider in {TTS_PROVIDER_GENIE, TTS_PROVIDER_GPT_SOVITS} else TTS_PROVIDER_GPT_SOVITS
+        tts_data: dict[str, object] = {
+            "provider": saved_provider,
             "enabled": bool(settings.enabled),
-            "gpt_sovits": {
-                "api_url": settings.api_url.strip(),
+        }
+        if section_provider == TTS_PROVIDER_GENIE:
+            tts_data["genie_tts"] = {
+                "api_url": settings.api_url.strip() or DEFAULT_GENIE_TTS_API_URL,
+                "work_dir": _path_for_config(settings.work_dir, self.base_dir),
+                "onnx_model_dir": _path_for_config(settings.onnx_model_dir, self.base_dir),
                 "ref_lang": settings.ref_lang.strip(),
                 "text_lang": settings.text_lang.strip(),
                 "timeout_seconds": int(settings.timeout_seconds),
-            },
-        }
+            }
+        elif section_provider == TTS_PROVIDER_GPT_SOVITS:
+            tts_data["gpt_sovits"] = {
+                "api_url": settings.api_url.strip(),
+                "work_dir": _path_for_config(settings.work_dir, self.base_dir),
+                "ref_lang": settings.ref_lang.strip(),
+                "text_lang": settings.text_lang.strip(),
+                "timeout_seconds": int(settings.timeout_seconds),
+            }
+        data["tts"] = tts_data
         save_yaml_mapping(self.api_config_path, data)
 
     def load_mcp_runtime_settings(self) -> MCPRuntimeSettings:
@@ -255,6 +300,27 @@ class AppSettingsService:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _optional_path(value: Any, base_dir: Path) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip().strip('"').strip("'")
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    return base_dir / path
+
+
+def _path_for_config(path: Path | None, base_dir: Path) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.resolve().relative_to(base_dir.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _int_value(value: Any, default: int) -> int:

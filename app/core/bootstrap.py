@@ -19,7 +19,14 @@ from app.config.character_loader import (
 )
 from app.storage.chat_history import ChatHistoryStore
 from app.core.debug_log import debug_log
-from app.voice.tts import GPTSoVITSTTSProvider, NullTTSProvider, TTSConfigError, TTSProvider
+from app.voice.tts import (
+    TTS_PROVIDER_GENIE,
+    GenieTTSProvider,
+    GPTSoVITSTTSProvider,
+    NullTTSProvider,
+    TTSConfigError,
+    TTSProvider,
+)
 from app.storage.visual_observation import VisualObservationStore
 from app.core.plugin_manager import SakuraPluginManager
 from app.orchestration import create_conversation_coordinator
@@ -208,11 +215,12 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
         tts_settings = settings_service.load_tts_settings(
             character_profile=character_profile,
         )
-        tts_provider = (
-            GPTSoVITSTTSProvider(tts_settings)
-            if tts_settings.enabled
-            else NullTTSProvider()
-        )
+        if not tts_settings.enabled:
+            tts_provider = NullTTSProvider()
+        elif tts_settings.provider == TTS_PROVIDER_GENIE:
+            tts_provider = GenieTTSProvider(tts_settings)
+        else:
+            tts_provider = GPTSoVITSTTSProvider(tts_settings)
     except TTSConfigError as exc:
         print(f"[TTS] 配置无效，已禁用 TTS：{exc}")
         debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})

@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import types
 import urllib.error
+import uuid
 from pathlib import Path
 
 if importlib.util.find_spec("PySide6") is None:
@@ -70,11 +71,14 @@ if importlib.util.find_spec("PySide6") is None:
     sys.modules["PySide6.QtMultimedia"] = qtmultimedia_module
 
 from app.voice.tts import (
+    GenieTTSProvider,
     GPTSoVITSTTSProvider,
     GPTSoVITSTTSSettings,
     TTSPreparedAudio,
+    _build_genie_endpoint_url,
     _load_tone_references,
     _resolve_request_text_lang,
+    _write_genie_audio,
 )
 from app.voice import VoicePlaybackController
 from app.voice.text_language_guard import should_skip_tts_text
@@ -123,10 +127,19 @@ def test_tts_yue_mixed_english_uses_auto_yue() -> None:
 
 
 def test_tone_references_load_four_part_rows_only() -> None:
-    ref_path = Path("characters/sakura/voice/refs/ref.txt")
+    root = _runtime_root("tone_refs")
+    ref_dir = root / "voice" / "refs"
+    audio_path = ref_dir / "tone_refs" / "neutral.wav"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"wav")
+    ref_path = ref_dir / "ref.txt"
+    ref_path.write_text(
+        "voice/refs/tone_refs/neutral.wav|JA|テスト|中性\n",
+        encoding="utf-8",
+    )
     rows = [line for line in ref_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
-    references = _load_tone_references(ref_path, Path("characters/sakura"))
+    references = _load_tone_references(ref_path, root)
 
     assert all(len(row.split("|")) == 4 for row in rows)
     assert references
@@ -177,6 +190,295 @@ def test_tts_service_probe_uses_tcp_connection_without_get(monkeypatch) -> None:
     assert GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
     assert messages == []
     assert calls == [(("127.0.0.1", 9880), 1)]
+
+
+def test_tts_service_probe_does_not_start_process_when_port_is_ready(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(
+        work_dir=Path("data/tts_bundles/installed/gpt_sovits_v2pro")
+    )
+    provider._service_checked = False
+    provider._server_process = None
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", lambda *_args, **_kwargs: FakeConnection())
+    monkeypatch.setattr(
+        "app.voice.tts.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应启动本地服务")),
+    )
+
+    assert GPTSoVITSTTSProvider._ensure_service_available(provider, lambda _msg: None)
+
+
+def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("gptsovits_start") / "gpt-sovits"
+    (work_dir / "runtime").mkdir(parents=True)
+    (work_dir / "runtime" / "python.exe").write_text("fake", encoding="utf-8")
+    (work_dir / "api_v2.py").write_text("fake", encoding="utf-8")
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(work_dir=work_dir)
+    provider._service_checked = False
+    provider._server_process = None
+    messages: list[str] = []
+    connection_calls = 0
+    popen_calls: list[list[str]] = []
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeProcess:
+        pid = 1234
+
+        def poll(self) -> None:
+            return None
+
+    def fake_create_connection(*_args: object, **_kwargs: object) -> FakeConnection:
+        nonlocal connection_calls
+        connection_calls += 1
+        if connection_calls == 1:
+            raise OSError("connection refused")
+        return FakeConnection()
+
+    def fake_popen(args, **_kwargs):  # type: ignore[no-untyped-def]
+        popen_calls.append(list(args))
+        return FakeProcess()
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("app.voice.tts.subprocess.Popen", fake_popen)
+
+    assert GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
+    assert messages == []
+    assert len(popen_calls) == 1
+    assert popen_calls[0] == [str(work_dir / "runtime" / "python.exe"), str(work_dir / "api_v2.py")]
+
+
+def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("gptsovits_missing_runtime") / "gpt-sovits"
+    work_dir.mkdir()
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(work_dir=work_dir)
+    provider._service_checked = False
+    provider._server_process = None
+    messages: list[str] = []
+
+    def fake_create_connection(*_args: object, **_kwargs: object) -> object:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
+
+    assert not GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
+    assert "运行时不存在" in messages[0]
+    assert "python.exe" in messages[0]
+
+
+def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("genie_start") / "genie"
+    (work_dir / "runtime").mkdir(parents=True)
+    (work_dir / "runtime" / "python.exe").write_text("fake", encoding="utf-8")
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
+    provider._service_checked = False
+    provider._server_process = None
+    messages: list[str] = []
+    connection_calls = 0
+    popen_calls: list[list[str]] = []
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self) -> None:
+            return None
+
+    def fake_create_connection(*_args: object, **_kwargs: object) -> FakeConnection:
+        nonlocal connection_calls
+        connection_calls += 1
+        if connection_calls == 1:
+            raise OSError("connection refused")
+        return FakeConnection()
+
+    def fake_popen(args, **_kwargs):  # type: ignore[no-untyped-def]
+        popen_calls.append(list(args))
+        return FakeProcess()
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("app.voice.tts.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(GenieTTSProvider, "_probe_genie_api", lambda *_args: True)
+
+    assert GenieTTSProvider._ensure_service_available(provider, messages.append)
+    assert messages == []
+    assert len(popen_calls) == 1
+    assert popen_calls[0][0] == str(work_dir / "runtime" / "python.exe")
+    assert popen_calls[0][1] == "-c"
+    assert "port=9881" in popen_calls[0][2]
+
+
+def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("genie_fallback_port") / "genie"
+    (work_dir / "runtime").mkdir(parents=True)
+    (work_dir / "runtime" / "python.exe").write_text("fake", encoding="utf-8")
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9880/")
+    provider._service_checked = False
+    provider._server_process = None
+    messages: list[str] = []
+    service_started = False
+    popen_calls: list[list[str]] = []
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeProcess:
+        pid = 4322
+
+        def poll(self) -> None:
+            return None
+
+    def fake_create_connection(address, **_kwargs):  # type: ignore[no-untyped-def]
+        _host, port = address
+        if port == 9880:
+            return FakeConnection()
+        if port == 9881 and service_started:
+            return FakeConnection()
+        raise OSError("connection refused")
+
+    def fake_popen(args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal service_started
+        popen_calls.append(list(args))
+        service_started = True
+        return FakeProcess()
+
+    def fake_probe_genie_api(self, _timeout):  # type: ignore[no-untyped-def]
+        return str(self.settings.api_url).endswith(":9881/")
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("app.voice.tts.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("app.voice.tts._can_bind_local_port", lambda *_args: True)
+    monkeypatch.setattr(GenieTTSProvider, "_probe_genie_api", fake_probe_genie_api)
+
+    assert GenieTTSProvider._ensure_service_available(provider, messages.append)
+    assert messages == []
+    assert provider.settings.api_url == "http://127.0.0.1:9881/"
+    assert "port=9881" in popen_calls[0][2]
+
+
+def test_genie_service_probe_rejects_non_genie_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(provider="genie-tts", api_url="http://127.0.0.1:9880/")
+    provider._service_checked = False
+    provider._server_process = None
+    messages: list[str] = []
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", lambda *_args, **_kwargs: FakeConnection())
+    monkeypatch.setattr(GenieTTSProvider, "_probe_genie_api", lambda *_args: False)
+
+    assert not GenieTTSProvider._ensure_service_available(provider, messages.append)
+    assert "不是 Genie TTS" in messages[0]
+
+
+def test_genie_endpoint_replaces_tts_path() -> None:
+    assert _build_genie_endpoint_url("http://127.0.0.1:9880/", "load_character") == "http://127.0.0.1:9880/load_character"
+    assert _build_genie_endpoint_url("http://127.0.0.1:9880/tts", "set_reference_audio") == "http://127.0.0.1:9880/set_reference_audio"
+
+
+def test_genie_audio_writer_accepts_raw_pcm() -> None:
+    output = _runtime_root("genie_audio") / "out.wav"
+
+    assert _write_genie_audio(b"\x00\x00\x10\x00\x00\x00", output)
+    assert output.is_file()
+
+
+def test_tts_provider_stop_local_service_terminates_owned_process(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[str] = []
+    monkeypatch.setattr("app.voice.tts.sys.platform", "linux")
+
+    class FakeProcess:
+        pid = 9876
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def wait(self, timeout: int) -> None:
+            calls.append(f"wait:{timeout}")
+
+    provider = types.SimpleNamespace(
+        settings=_minimal_tts_settings(),
+        _server_process=FakeProcess(),
+    )
+
+    GPTSoVITSTTSProvider._stop_local_service(provider)
+
+    assert calls == ["terminate", "wait:5"]
+    assert provider._server_process is None
+
+
+def test_tts_provider_stop_local_service_uses_taskkill_tree_on_windows(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[object] = []
+
+    class FakeProcess:
+        pid = 2468
+        alive = True
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None if self.alive else 0
+
+        def wait(self, timeout: int) -> None:
+            calls.append(f"wait:{timeout}")
+            self.alive = False
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def kill(self) -> None:
+            calls.append("kill")
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((list(args), kwargs.get("timeout")))
+        return types.SimpleNamespace(returncode=0)
+
+    provider = types.SimpleNamespace(
+        settings=_minimal_tts_settings(),
+        _server_process=FakeProcess(),
+    )
+    monkeypatch.setattr("app.voice.tts.sys.platform", "win32")
+    monkeypatch.setattr("app.voice.tts.subprocess.run", fake_run)
+
+    GPTSoVITSTTSProvider._stop_local_service(provider)
+
+    assert calls[0] == (["taskkill", "/PID", "2468", "/T", "/F"], 5)
+    assert calls[1] == "wait:5"
+    assert "terminate" not in calls
+    assert provider._server_process is None
 
 
 def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -447,14 +749,38 @@ def test_voice_playback_controller_ignores_prepare_error() -> None:
     controller.prepare_next(ChatSegment("次の一段", "中性"))
 
 
-def _minimal_tts_settings() -> GPTSoVITSTTSSettings:
+def _minimal_tts_settings(
+    work_dir: Path | None = None,
+    *,
+    provider: str = "gpt-sovits",
+    api_url: str = "http://127.0.0.1:9880/tts",
+) -> GPTSoVITSTTSSettings:
+    root = _runtime_root("minimal_tts")
+    ref_audio_path = root / "voice" / "refs" / "tone_refs" / "neutral.wav"
+    ref_audio_path.parent.mkdir(parents=True)
+    ref_audio_path.write_bytes(b"wav")
+    ref_text_path = root / "voice" / "refs" / "ref.txt"
+    ref_text_path.write_text(
+        "voice/refs/tone_refs/neutral.wav|JA|テスト|中性\n",
+        encoding="utf-8",
+    )
     return GPTSoVITSTTSSettings(
         enabled=True,
-        api_url="http://127.0.0.1:9880/tts",
-        ref_audio_path=Path("characters/sakura/voice/refs/tone_refs/00_中性_VO01_2785.ogg"),
-        ref_text_path=Path("characters/sakura/voice/refs/ref.txt"),
+        provider=provider,
+        api_url=api_url,
+        ref_audio_path=ref_audio_path,
+        ref_text_path=ref_text_path,
         ref_text="テスト",
+        work_dir=work_dir,
+        character_name="夜乃桜",
+        onnx_model_dir=Path("data/tts_bundles/onnx/sakura") if provider == "genie-tts" else None,
         ref_lang="ja",
         text_lang="ja",
         timeout_seconds=1,
     )
+
+
+def _runtime_root(name: str) -> Path:
+    root = Path(__file__).resolve().parents[2] / "__pycache__" / "test_runtime" / name / uuid.uuid4().hex
+    root.mkdir(parents=True, exist_ok=True)
+    return root

@@ -4,12 +4,18 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from app.core.app_context import AppContext
 from app.core.bootstrap import build_deferred_services, build_initial_app_context
 from app.config.character_loader import CharacterConfigError
+from app.config.settings_service import AppSettingsService
+from app.agent.mcp import MCPRuntimeSettings
+from app.agent.proactive_care import ProactiveCareSettings
 from app.ui.pet_window import PetWindow
+from app.ui.settings_dialog import SettingsDialog
+from app.ui.portrait_controller import PORTRAIT_SCALE_DEFAULT_PERCENT
+from app.voice.tts import TTSConfigError
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +56,18 @@ def main() -> int:
     try:
         context = build_initial_app_context(BASE_DIR)
     except CharacterConfigError as exc:
+        if not _character_packages_missing(BASE_DIR):
+            print(f"[Character] 配置无效：{exc}")
+            return 1
+        try:
+            context = _open_first_run_settings(BASE_DIR)
+        except (CharacterConfigError, OSError, TTSConfigError, ValueError) as first_run_exc:
+            QMessageBox.critical(None, "启动失败", str(first_run_exc))
+            print(f"[Character] 配置无效：{first_run_exc}")
+            return 1
+        if context is None:
+            return 0
+    except (OSError, ValueError) as exc:
         print(f"[Character] 配置无效：{exc}")
         return 1
 
@@ -58,6 +76,67 @@ def main() -> int:
     QTimer.singleShot(0, lambda: _start_deferred_startup(BASE_DIR, pet_window))
 
     return app.exec()
+
+
+def _character_packages_missing(base_dir: Path) -> bool:
+    characters_dir = base_dir / "characters"
+    if not characters_dir.is_dir():
+        return True
+    try:
+        return not any(characters_dir.glob("*/character.json"))
+    except OSError:
+        return False
+
+
+def _open_first_run_settings(base_dir: Path) -> AppContext | None:
+    settings_service = AppSettingsService(base_dir=base_dir)
+    api_settings = settings_service.load_api_settings()
+    tts_settings = settings_service.load_tts_settings(
+        validate_enabled=False,
+        character_profile=None,
+    )
+    dialog = SettingsDialog(
+        api_settings=api_settings,
+        tts_settings=tts_settings,
+        base_dir=base_dir,
+        character_registry=None,
+        current_character=None,
+        proactive_care_settings=settings_service.load_proactive_care_settings(),
+        mcp_settings=settings_service.load_mcp_runtime_settings(),
+        debug_log_settings=settings_service.load_debug_log_settings(),
+        portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
+    )
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    if (
+        dialog.result_api_settings is None
+        or dialog.result_tts_settings is None
+        or dialog.result_character_id is None
+        or dialog.result_proactive_care_settings is None
+        or dialog.result_mcp_settings is None
+        or dialog.result_debug_log_settings is None
+        or dialog.result_portrait_scale_percent is None
+        or dialog.character_registry is None
+    ):
+        QMessageBox.warning(None, "配置无效", "请先导入并选择一个角色包。")
+        return None
+
+    settings_service.save_api_settings(dialog.result_api_settings)
+    settings_service.save_tts_settings(dialog.result_tts_settings)
+    settings_service.save_current_character_id(
+        dialog.character_registry,
+        dialog.result_character_id,
+    )
+    settings_service.save_proactive_care_settings(
+        dialog.result_proactive_care_settings or ProactiveCareSettings()
+    )
+    settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings or MCPRuntimeSettings())
+    settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
+    settings_service.save_system_values(
+        "ui",
+        {"portrait_scale_percent": int(dialog.result_portrait_scale_percent)},
+    )
+    return build_initial_app_context(base_dir)
 
 
 def _start_deferred_startup(base_dir: Path, pet_window: PetWindow) -> None:

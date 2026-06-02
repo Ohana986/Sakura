@@ -64,6 +64,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
             ref_audio_path=root / "ref.wav",
             ref_text_path=root / "ref.txt",
             ref_text="hello",
+            work_dir=root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro",
             ref_lang="ja",
             text_lang="ja",
             timeout_seconds=22,
@@ -88,12 +89,83 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
 
     assert api["llm"]["model"] == "demo-model"
     assert api["tts"]["provider"] == "gpt-sovits"
+    assert api["tts"]["gpt_sovits"]["work_dir"] == "data/tts_bundles/installed/gpt_sovits_v2pro"
     assert api["tts"]["gpt_sovits"]["timeout_seconds"] == 22
     assert characters["current_character_id"] == "nanami"
     assert system["mcp"]["windows_enabled"] is True
     assert system["debug"]["enabled"] is True
     assert system["debug"]["body_enabled"] is True
     assert system["proactive_care"]["check_interval_minutes"] == 5
+
+
+def test_settings_service_loads_tts_work_dir_and_keeps_legacy_blank() -> None:
+    root = _runtime_root("yaml_tts_work_dir")
+    service = AppSettingsService(root)
+    service.api_config_path.parent.mkdir(parents=True)
+    service.api_config_path.write_text(
+        """
+tts:
+  provider: gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+    work_dir: data/tts_bundles/installed/gpt_sovits_v2pro
+    ref_lang: ja
+    text_lang: ja
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    settings = service.load_tts_settings(validate_enabled=False)
+
+    assert settings.work_dir == root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro"
+
+    service.api_config_path.write_text(
+        """
+tts:
+  provider: gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    legacy_settings = service.load_tts_settings(validate_enabled=False)
+
+    assert legacy_settings.work_dir is None
+
+
+def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
+    root = _runtime_root("yaml_genie_tts")
+    service = AppSettingsService(root)
+    settings = GPTSoVITSTTSSettings(
+        enabled=True,
+        provider="genie-tts",
+        api_url="http://127.0.0.1:9881/",
+        ref_audio_path=root / "ref.wav",
+        ref_text_path=root / "ref.txt",
+        ref_text="hello",
+        work_dir=root / "data" / "tts_bundles" / "installed" / "genie_tts_server",
+        character_name="夜乃桜",
+        onnx_model_dir=root / "data" / "tts_bundles" / "onnx" / "sakura",
+        ref_lang="ja",
+        text_lang="ja",
+        timeout_seconds=33,
+    )
+
+    service.save_tts_settings(settings)
+    saved = load_yaml_mapping(service.api_config_path)
+    loaded = service.load_tts_settings(validate_enabled=False)
+
+    assert saved["tts"]["provider"] == "genie-tts"
+    assert saved["tts"]["genie_tts"]["api_url"] == "http://127.0.0.1:9881/"
+    assert saved["tts"]["genie_tts"]["work_dir"] == "data/tts_bundles/installed/genie_tts_server"
+    assert saved["tts"]["genie_tts"]["onnx_model_dir"] == "data/tts_bundles/onnx/sakura"
+    assert loaded.provider == "genie-tts"
+    assert loaded.work_dir == root / "data" / "tts_bundles" / "installed" / "genie_tts_server"
+    assert loaded.onnx_model_dir == root / "data" / "tts_bundles" / "onnx" / "sakura"
+    assert loaded.timeout_seconds == 33
 
 
 def test_settings_service_loads_debug_log_settings() -> None:

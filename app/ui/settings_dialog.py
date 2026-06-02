@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
@@ -32,6 +33,11 @@ from PySide6.QtWidgets import (
 
 from app.agent.memory import MemoryStore
 from app.agent.mcp import MCPRuntimeSettings
+from app.config.character_archive import (
+    CharacterArchiveError,
+    export_character_archive,
+    import_character_archive,
+)
 from app.config.settings_service import DebugLogSettings
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.config.character_loader import CharacterProfile, CharacterRegistry
@@ -50,7 +56,15 @@ from app.agent.proactive_care import (
     PROACTIVE_MIN_SCREEN_CONTEXT_BATCH_LIMIT,
     ProactiveCareSettings,
 )
-from app.voice.tts import GPTSoVITSTTSSettings, TTSConfigError
+from app.voice.tts import (
+    DEFAULT_GENIE_TTS_API_URL,
+    DEFAULT_GPT_SOVITS_API_URL,
+    TTS_PROVIDER_GENIE,
+    TTS_PROVIDER_GPT_SOVITS,
+    GPTSoVITSTTSSettings,
+    TTSConfigError,
+)
+from app.ui.tts_bundle_dialog import TTSBundleDownloadDialog
 from sdk.types import ToolsTabContribution
 
 
@@ -97,6 +111,28 @@ class MemoryListWorker(QObject):
             self.finished.emit()
 
 
+class CharacterArchiveExportWorker(QObject):
+    succeeded = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, profile: CharacterProfile, output_path: Path) -> None:
+        super().__init__()
+        self.profile = profile
+        self.output_path = output_path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            export_character_archive(self.profile, self.output_path)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(str(self.output_path))
+        finally:
+            self.finished.emit()
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -137,6 +173,8 @@ class SettingsDialog(QDialog):
         self._api_test_worker: ApiConnectionTestWorker | None = None
         self._memory_list_thread: QThread | None = None
         self._memory_list_worker: MemoryListWorker | None = None
+        self._character_export_thread: QThread | None = None
+        self._character_export_worker: CharacterArchiveExportWorker | None = None
         self._memory_reload_pending = False
         self._syncing_memory_selection = False
 
@@ -144,8 +182,7 @@ class SettingsDialog(QDialog):
         self.resize(560, 400)
 
         tabs = QTabWidget(self)
-        if character_registry is not None and current_character is not None:
-            tabs.addTab(self._build_character_tab(character_registry, current_character), "角色")
+        tabs.addTab(self._build_character_tab(character_registry, current_character), "角色")
         tabs.addTab(self._build_api_tab(api_settings), "API")
         tabs.addTab(self._build_tts_tab(tts_settings), "TTS")
         tabs.addTab(
@@ -169,6 +206,7 @@ class SettingsDialog(QDialog):
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
             self,
         )
+        self.button_box = buttons
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -264,23 +302,43 @@ class SettingsDialog(QDialog):
 
     def _build_character_tab(
         self,
-        character_registry: CharacterRegistry,
-        current_character: CharacterProfile,
+        character_registry: CharacterRegistry | None,
+        current_character: CharacterProfile | None,
     ) -> QWidget:
         tab = QWidget(self)
         self.character_combo = QComboBox(tab)
-        for profile in character_registry.all():
-            self.character_combo.addItem(profile.display_name, profile.id)
-            if profile.id == current_character.id:
-                self.character_combo.setCurrentIndex(self.character_combo.count() - 1)
+        self.character_empty_label = QLabel("尚未导入角色", tab)
+        self._refresh_character_combo(
+            current_character.id if current_character is not None else None
+        )
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
+        form_layout.addRow("状态", self.character_empty_label)
         form_layout.addRow("当前角色", self.character_combo)
         form_layout.addRow("立绘大小", self._build_portrait_scale_control(tab))
+        form_layout.addRow("角色包", self._build_character_archive_controls(tab))
         tab.setLayout(form_layout)
+        self._sync_character_archive_controls()
         return tab
+
+    def _build_character_archive_controls(self, parent: QWidget) -> QWidget:
+        container = QWidget(parent)
+        self.character_import_button = QPushButton("导入 .char", container)
+        self.character_export_button = QPushButton("导出当前角色", container)
+        self.character_import_button.clicked.connect(self._import_character_archive)
+        self.character_export_button.clicked.connect(self._export_current_character_archive)
+        self._sync_character_archive_controls()
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self.character_import_button)
+        layout.addWidget(self.character_export_button)
+        layout.addStretch(1)
+        container.setLayout(layout)
+        return container
 
     def _build_portrait_scale_control(self, parent: QWidget) -> QWidget:
         container = QWidget(parent)
@@ -348,11 +406,22 @@ class SettingsDialog(QDialog):
 
     def _build_tts_tab(self, settings: GPTSoVITSTTSSettings) -> QWidget:
         tab = QWidget(self)
-        self.tts_enabled_check = QCheckBox("启用 GPT-SoVITS 语音", tab)
+        self.tts_enabled_check = QCheckBox("启用 TTS 语音", tab)
         self.tts_enabled_check.setChecked(settings.enabled)
 
+        self.tts_provider_combo = QComboBox(tab)
+        self.tts_provider_combo.addItem("GPT-SoVITS（GPU）", TTS_PROVIDER_GPT_SOVITS)
+        self.tts_provider_combo.addItem("Genie TTS（CPU）", TTS_PROVIDER_GENIE)
+        provider_index = self.tts_provider_combo.findData(settings.provider)
+        self.tts_provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+
         self.tts_api_url_edit = QLineEdit(settings.api_url, tab)
-        self.tts_api_url_edit.setPlaceholderText("http://127.0.0.1:9880/tts")
+        self.tts_api_url_edit.setPlaceholderText(_default_tts_api_url(settings.provider))
+        self.tts_work_dir_edit = QLineEdit(str(settings.work_dir or ""), tab)
+        self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_v2pro")
+        self.tts_bundle_download_button = QPushButton("一键下载 TTS 整合包", tab)
+        self.tts_bundle_download_button.clicked.connect(self._download_gpt_sovits_bundle)
+        self.tts_provider_combo.currentIndexChanged.connect(lambda _index: self._sync_tts_provider_controls())
 
         self.ref_lang_edit = QLineEdit(settings.ref_lang, tab)
         self.text_lang_edit = QLineEdit(settings.text_lang, tab)
@@ -366,11 +435,15 @@ class SettingsDialog(QDialog):
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
         form_layout.addRow("", self.tts_enabled_check)
+        form_layout.addRow("TTS 提供器", self.tts_provider_combo)
         form_layout.addRow("API URL", self.tts_api_url_edit)
+        form_layout.addRow("TTS 工作目录", self.tts_work_dir_edit)
+        form_layout.addRow("", self.tts_bundle_download_button)
         form_layout.addRow("参考语言", self.ref_lang_edit)
         form_layout.addRow("文本语言", self.text_lang_edit)
         form_layout.addRow("超时", self.tts_timeout_spin)
         tab.setLayout(form_layout)
+        self._sync_tts_provider_controls()
         return tab
 
     def _build_privacy_tab(
@@ -1043,6 +1116,9 @@ class SettingsDialog(QDialog):
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
             return
+        if self._character_export_thread is not None:
+            QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再保存设置。")
+            return
 
         api_settings = self._validated_api_settings()
         if api_settings is None:
@@ -1050,10 +1126,14 @@ class SettingsDialog(QDialog):
         tts_settings = self._validated_tts_settings()
         if tts_settings is None:
             return
+        character_id = self._selected_character_id()
+        if character_id is None:
+            QMessageBox.warning(self, "配置无效", "请先导入并选择一个角色包。")
+            return
 
         self.result_api_settings = api_settings
         self.result_tts_settings = tts_settings
-        self.result_character_id = self._selected_character_id()
+        self.result_character_id = character_id
         self.result_portrait_scale_percent = self._selected_portrait_scale_percent()
         self.result_proactive_care_settings = ProactiveCareSettings(
             enabled=self.proactive_screen_context_enabled_check.isChecked(),
@@ -1078,7 +1158,17 @@ class SettingsDialog(QDialog):
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
             return
+        if self._character_export_thread is not None:
+            QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
+            return
         super().reject()
+
+    def closeEvent(self, event):  # type: ignore[no-untyped-def]
+        if self._character_export_thread is not None:
+            QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _test_api_settings(self) -> None:
         settings = self._validated_api_settings()
@@ -1118,6 +1208,126 @@ class SettingsDialog(QDialog):
         self._api_test_thread = None
         self._api_test_worker = None
 
+    def _download_gpt_sovits_bundle(self) -> None:
+        dialog = TTSBundleDownloadDialog(self.base_dir, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.downloaded_work_dir is None:
+            return
+        provider = getattr(dialog, "downloaded_provider", None) or TTS_PROVIDER_GPT_SOVITS
+        provider_index = self.tts_provider_combo.findData(provider)
+        if provider_index >= 0:
+            self.tts_provider_combo.setCurrentIndex(provider_index)
+        self.tts_work_dir_edit.setText(str(dialog.downloaded_work_dir))
+        self.tts_api_url_edit.setText(_default_tts_api_url(provider))
+        self.tts_enabled_check.setChecked(True)
+
+    @Slot()
+    def _sync_tts_provider_controls(self) -> None:
+        provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
+        self.tts_api_url_edit.setPlaceholderText(_default_tts_api_url(provider))
+        if provider == TTS_PROVIDER_GENIE:
+            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/genie_tts_server")
+        else:
+            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_v2pro")
+
+    def _import_character_archive(self) -> None:
+        if self._character_export_thread is not None:
+            QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再导入。")
+            return
+        path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 Sakura 角色包",
+            str(self.base_dir),
+            "Sakura 角色包 (*.char)",
+        )
+        if not path_text:
+            return
+        try:
+            result = import_character_archive(Path(path_text), self.base_dir)
+            self.character_registry = CharacterRegistry(self.base_dir)
+            self._refresh_character_combo(result.character_id)
+            self._sync_character_archive_controls()
+        except (CharacterArchiveError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "导入成功",
+            f"已导入角色「{result.display_name}」。点击保存后会切换到该角色。",
+        )
+
+    def _export_current_character_archive(self) -> None:
+        if self._character_export_thread is not None:
+            return
+        profile = self._selected_character_profile()
+        if profile is None:
+            QMessageBox.warning(self, "导出失败", "当前没有可导出的角色。")
+            return
+        output_text, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 Sakura 角色包",
+            str(self.base_dir / f"{profile.id}.char"),
+            "Sakura 角色包 (*.char)",
+        )
+        if not output_text:
+            return
+        output_path = Path(output_text)
+        if output_path.suffix.lower() != ".char":
+            output_path = output_path.with_suffix(".char")
+        self._start_character_archive_export(profile, output_path)
+
+    def _start_character_archive_export(
+        self,
+        profile: CharacterProfile,
+        output_path: Path,
+    ) -> None:
+        self._set_character_export_busy(True)
+        thread = QThread(self)
+        worker = CharacterArchiveExportWorker(profile, output_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_character_export_success)
+        worker.failed.connect(self._handle_character_export_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_character_export_state)
+
+        self._character_export_thread = thread
+        self._character_export_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _handle_character_export_success(self, output_path: str) -> None:
+        QMessageBox.information(self, "导出成功", f"角色包已导出到：{output_path}")
+
+    @Slot(str)
+    def _handle_character_export_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "导出失败", message)
+
+    @Slot()
+    def _reset_character_export_state(self) -> None:
+        self._character_export_thread = None
+        self._character_export_worker = None
+        self._set_character_export_busy(False)
+
+    def _set_character_export_busy(self, busy: bool) -> None:
+        if hasattr(self, "button_box"):
+            save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+            cancel_button = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+            if save_button is not None:
+                save_button.setEnabled(not busy)
+            if cancel_button is not None:
+                cancel_button.setEnabled(not busy)
+        if hasattr(self, "character_import_button"):
+            self.character_import_button.setEnabled(not busy)
+        if hasattr(self, "character_export_button"):
+            self.character_export_button.setEnabled(
+                not busy and self._selected_character_profile() is not None
+            )
+
+    def _sync_character_archive_controls(self) -> None:
+        self._set_character_export_busy(self._character_export_thread is not None)
+
     def _validated_api_settings(self) -> ApiSettings | None:
         base_url = self.base_url_edit.text().strip().rstrip("/")
         api_key = self.api_key_edit.text().strip()
@@ -1142,7 +1352,9 @@ class SettingsDialog(QDialog):
 
     def _validated_tts_settings(self) -> GPTSoVITSTTSSettings | None:
         enabled = self.tts_enabled_check.isChecked()
+        provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
         api_url = self.tts_api_url_edit.text().strip()
+        work_dir = _optional_path(self.tts_work_dir_edit.text(), self.base_dir)
         ref_lang = self.ref_lang_edit.text().strip()
         text_lang = self.text_lang_edit.text().strip()
 
@@ -1159,6 +1371,9 @@ class SettingsDialog(QDialog):
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=self.tts_timeout_spin.value(),
+                provider=provider,
+                work_dir=work_dir,
+                onnx_model_dir=_default_genie_onnx_dir(self.base_dir, selected_profile) if provider == TTS_PROVIDER_GENIE else None,
                 validate_enabled=False,
             )
         else:
@@ -1168,8 +1383,16 @@ class SettingsDialog(QDialog):
                 ref_audio_path=self.tts_settings.ref_audio_path,
                 ref_text_path=self.tts_settings.ref_text_path,
                 ref_text=self.tts_settings.ref_text,
+                provider=provider,
                 gpt_model_path=self.tts_settings.gpt_model_path,
                 sovits_model_path=self.tts_settings.sovits_model_path,
+                work_dir=work_dir,
+                character_name=self.tts_settings.character_name or "sakura",
+                onnx_model_dir=(
+                    self.tts_settings.onnx_model_dir or _default_genie_onnx_dir(self.base_dir, selected_profile)
+                    if provider == TTS_PROVIDER_GENIE
+                    else None
+                ),
                 ref_lang=ref_lang,
                 text_lang=text_lang,
                 timeout_seconds=self.tts_timeout_spin.value(),
@@ -1202,10 +1425,54 @@ class SettingsDialog(QDialog):
             return normalize_portrait_scale_percent(self.portrait_scale_spin.value())
         return self.portrait_scale_percent
 
+    def _refresh_character_combo(self, selected_character_id: str | None = None) -> None:
+        if not hasattr(self, "character_combo"):
+            return
+        selected_id = selected_character_id or self._selected_character_id()
+        self.character_combo.blockSignals(True)
+        self.character_combo.clear()
+        selected_index = -1
+        profiles = list(self.character_registry.all()) if self.character_registry is not None else []
+        for profile in profiles:
+            self.character_combo.addItem(profile.display_name, profile.id)
+            if profile.id == selected_id:
+                selected_index = self.character_combo.count() - 1
+        if selected_index >= 0:
+            self.character_combo.setCurrentIndex(selected_index)
+        elif self.character_combo.count() > 0:
+            self.character_combo.setCurrentIndex(0)
+        else:
+            self.character_combo.addItem("尚未导入角色", None)
+        has_character = bool(profiles)
+        self.character_combo.setEnabled(has_character)
+        if hasattr(self, "character_empty_label"):
+            self.character_empty_label.setVisible(not has_character)
+        self.character_combo.blockSignals(False)
+        self._sync_character_archive_controls()
+
 
 def _is_http_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _default_tts_api_url(provider: str) -> str:
+    return DEFAULT_GENIE_TTS_API_URL if provider == TTS_PROVIDER_GENIE else DEFAULT_GPT_SOVITS_API_URL
+
+
+def _default_genie_onnx_dir(base_dir: Path, profile: CharacterProfile | None) -> Path:
+    character_id = profile.id if profile is not None else "default"
+    return base_dir / "data" / "tts_bundles" / "onnx" / character_id
+
+
+def _optional_path(value: str, base_dir: Path) -> Path | None:
+    text = value.strip().strip('"').strip("'")
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    return base_dir / path
 
 
 def _compact_memory_id(memory_id: str) -> str:

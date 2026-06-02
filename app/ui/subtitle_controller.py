@@ -9,8 +9,9 @@ from app.llm.chat_reply import ChatSegment
 from app.core.debug_log import debug_log
 from app.voice import VoicePlaybackController
 
-
+#字幕逐字显示速度
 SPEECH_TYPING_INTERVAL_MS = 35
+#分段回复之间的默认停顿时间
 REPLY_SEGMENT_PAUSE_MS = 100
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]

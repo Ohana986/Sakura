@@ -84,6 +84,8 @@ from app.ui.portrait_controller import (
     normalize_portrait_scale_percent,
 )
 from app.voice.tts import (
+    TTS_PROVIDER_GENIE,
+    GenieTTSProvider,
     GPTSoVITSTTSProvider,
     GPTSoVITSTTSSettings,
     NullTTSProvider,
@@ -476,8 +478,31 @@ class PetWindow(QWidget):
 
     @Slot()
     def close_external_tools(self) -> None:
+        self.close_tts_tools()
         self.close_mcp_tools()
         self.close_plugins()
+
+    @Slot()
+    def close_tts_tools(self) -> None:
+        providers = [self.tts_provider, *self.retired_tts_providers]
+        self.retired_tts_providers = []
+        seen: set[int] = set()
+        for provider in providers:
+            provider_id = id(provider)
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            close = getattr(provider, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "TTS",
+                    "关闭 TTS Provider 失败",
+                    {"provider": type(provider).__name__, "error": str(exc)},
+                )
 
     @Slot()
     def close_mcp_tools(self) -> None:
@@ -1876,7 +1901,7 @@ class PetWindow(QWidget):
         if self.plugin_manager is not services.plugin_manager:
             self.plugin_manager.shutdown_all()
 
-        self.retired_tts_providers.append(self.tts_provider)
+        self._retire_tts_provider(self.tts_provider)
         self.tts_provider = services.tts_provider
         self.voice_playback_controller.set_provider(services.tts_provider)
         self._warm_up_tts_playback(services.tts_provider)
@@ -2065,8 +2090,9 @@ class PetWindow(QWidget):
         ):
             return
 
+        dialog_character_registry = getattr(dialog, "character_registry", None) or self.character_registry
         try:
-            selected_profile = self.character_registry.get(dialog.result_character_id)
+            selected_profile = dialog_character_registry.get(dialog.result_character_id)
         except CharacterConfigError as exc:
             QMessageBox.critical(self, "角色配置无效", str(exc))
             return
@@ -2080,6 +2106,7 @@ class PetWindow(QWidget):
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
+            self.character_registry = dialog_character_registry
             self.settings_service.save_current_character_id(
                 self.character_registry,
                 selected_profile.id,
@@ -2106,7 +2133,7 @@ class PetWindow(QWidget):
         self.mcp_settings = dialog.result_mcp_settings
         self.debug_log_settings = dialog.result_debug_log_settings
         self._sync_proactive_care_timer()
-        self.retired_tts_providers.append(self.tts_provider)
+        self._retire_tts_provider(self.tts_provider)
         self.tts_provider = new_tts_provider
         self.voice_playback_controller.set_provider(new_tts_provider)
         self._warm_up_tts_playback(new_tts_provider)
@@ -2190,11 +2217,12 @@ class PetWindow(QWidget):
             debug_log("PetWindow", "设置保存后 TTS 保持关闭")
             return NullTTSProvider()
         try:
-            provider = GPTSoVITSTTSProvider(settings)
+            provider = GenieTTSProvider(settings) if settings.provider == TTS_PROVIDER_GENIE else GPTSoVITSTTSProvider(settings)
             debug_log(
                 "PetWindow",
                 "设置保存后 TTS Provider 已创建",
                 {
+                    "provider": settings.provider,
                     "api_url": settings.api_url,
                     "timeout_seconds": settings.timeout_seconds,
                 },
@@ -2204,6 +2232,19 @@ class PetWindow(QWidget):
             debug_log("PetWindow", "TTS 配置无效", {"error": str(exc)})
             QMessageBox.critical(self, "TTS 配置无效", f"无法启用 TTS，当前语音配置保持不变：{exc}")
             return None
+
+    def _retire_tts_provider(self, provider: TTSProvider) -> None:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "TTS",
+                    "切换配置时关闭旧 TTS Provider 失败",
+                    {"provider": type(provider).__name__, "error": str(exc)},
+                )
+        self.retired_tts_providers.append(provider)
 
     def _default_tts_settings(self) -> GPTSoVITSTTSSettings:
         if self.character_profile.voice is not None:

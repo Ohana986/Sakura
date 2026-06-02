@@ -10,6 +10,7 @@ venv/
 runtime/
 env/
 node_modules/
+characters/
 
 .pytest_cache/
 .pytest_tmp/
@@ -21,13 +22,14 @@ temp/
 
 *.log
 data/chat_history.jsonl
-data/chat_history/sakura.jsonl
+data/chat_history/
 data/memory/
 data/memory.json
 data/memory_curation_state.json
 data/reminders.json
 data/visual_observations/
 data/notes/
+data/tts_bundles/
 data/config/api.yaml
 data/config/characters.yaml
 data/config/system_config.yaml
@@ -44,6 +46,3 @@ plugins/playwright_browser/**/*.py[cod]
 
 # 备份文件
 *.bak
-
-# 临时ACL备份文件.git_acl*
-EchoBot分析.md
