@@ -45,3 +45,4 @@ plugins/playwright_browser/**/*.py[cod]
 *.bak
 
 # 临时ACL备份文件.git_acl*
+EchoBot分析.md
