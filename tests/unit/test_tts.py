@@ -208,12 +208,57 @@ def test_tts_service_probe_does_not_start_process_when_port_is_ready(monkeypatch
             return None
 
     monkeypatch.setattr("app.voice.tts.socket.create_connection", lambda *_args, **_kwargs: FakeConnection())
+    monkeypatch.setattr("app.voice.tts._find_running_local_tts_process", lambda *_args: None)
     monkeypatch.setattr(
         "app.voice.tts.subprocess.Popen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应启动本地服务")),
     )
 
     assert GPTSoVITSTTSProvider._ensure_service_available(provider, lambda _msg: None)
+
+
+def test_genie_service_probe_adopts_existing_local_process_when_port_is_ready(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("genie_adopt") / "genie"
+    (work_dir / "runtime").mkdir(parents=True)
+    (work_dir / "runtime" / "python.exe").write_text("fake", encoding="utf-8")
+    provider = types.SimpleNamespace()
+    provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
+    provider._service_checked = False
+    provider._server_process = None
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    python_exe = work_dir.resolve() / "runtime" / "python.exe"
+    command_line = (
+        f'"{python_exe}" -c "import genie_tts\n'
+        "genie_tts.start_server(host='127.0.0.1', port=9881, workers=1)\n"
+        '"'
+    )
+
+    def fake_run(args, **_kwargs):  # type: ignore[no-untyped-def]
+        if args[0] == "netstat":
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="  TCP    127.0.0.1:9881     0.0.0.0:0      LISTENING       41608\n",
+            )
+        if args[0] == "powershell":
+            return types.SimpleNamespace(returncode=0, stdout=command_line)
+        raise AssertionError(f"未预期的命令：{args}")
+
+    monkeypatch.setattr("app.voice.tts.sys.platform", "win32")
+    monkeypatch.setattr("app.voice.tts.os.getpid", lambda: 1234)
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", lambda *_args, **_kwargs: FakeConnection())
+    monkeypatch.setattr("app.voice.tts.subprocess.run", fake_run)
+    monkeypatch.setattr(GenieTTSProvider, "_probe_genie_api", lambda *_args: True)
+
+    assert GenieTTSProvider._ensure_service_available(provider, lambda _msg: None)
+    assert provider._server_process is not None
+    assert provider._server_process.pid == 41608
 
 
 def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -281,6 +326,59 @@ def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  
     assert "python.exe" in messages[0]
 
 
+def test_gptsovits_ensure_ready_returns_success_after_service_and_weights(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
+    calls: list[str] = []
+
+    def fake_service(_self, _fail):  # type: ignore[no-untyped-def]
+        calls.append("service")
+        return True
+
+    def fake_weights(_self, _fail):  # type: ignore[no-untyped-def]
+        calls.append("weights")
+        return True
+
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_ensure_service_available", fake_service)
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_ensure_character_weights", fake_weights)
+
+    ok, message = GPTSoVITSTTSProvider.ensure_ready(provider)
+
+    assert ok
+    assert "已就绪" in message
+    assert calls == ["service", "weights"]
+
+
+def test_gptsovits_ensure_ready_returns_service_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
+
+    def fake_service(_self, fail):  # type: ignore[no-untyped-def]
+        fail("GPT-SoVITS 服务不可用")
+        return False
+
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_ensure_service_available", fake_service)
+
+    ok, message = GPTSoVITSTTSProvider.ensure_ready(provider)
+
+    assert not ok
+    assert "服务不可用" in message
+
+
+def test_gptsovits_ensure_ready_returns_weight_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
+
+    def fake_weights(_self, fail):  # type: ignore[no-untyped-def]
+        fail("权重切换失败")
+        return False
+
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_ensure_service_available", lambda *_args: True)
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "_ensure_character_weights", fake_weights)
+
+    ok, message = GPTSoVITSTTSProvider.ensure_ready(provider)
+
+    assert not ok
+    assert "权重切换失败" in message
+
+
 def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     work_dir = _runtime_root("genie_start") / "genie"
     (work_dir / "runtime").mkdir(parents=True)
@@ -327,6 +425,50 @@ def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) 
     assert popen_calls[0][0] == str(work_dir / "runtime" / "python.exe")
     assert popen_calls[0][1] == "-c"
     assert "port=9881" in popen_calls[0][2]
+
+
+def test_genie_ensure_ready_loads_model_and_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GenieTTSProvider(_minimal_tts_settings(provider="genie-tts", api_url="http://127.0.0.1:9881/"))
+    calls: list[str] = []
+
+    def fake_service(_self, _fail):  # type: ignore[no-untyped-def]
+        calls.append("service")
+        return True
+
+    def fake_model(_self, language, _fail):  # type: ignore[no-untyped-def]
+        calls.append(f"model:{language}")
+        return True
+
+    def fake_reference(_self, reference, _fail):  # type: ignore[no-untyped-def]
+        calls.append(f"reference:{reference.ref_text}")
+        return True
+
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_service_available", fake_service)
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_character_model", fake_model)
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_reference_audio", fake_reference)
+
+    ok, message = GenieTTSProvider.ensure_ready(provider)
+
+    assert ok
+    assert "已就绪" in message
+    assert calls == ["service", "model:ja", "reference:テスト"]
+
+
+def test_genie_ensure_ready_returns_reference_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GenieTTSProvider(_minimal_tts_settings(provider="genie-tts", api_url="http://127.0.0.1:9881/"))
+
+    def fake_reference(_self, _reference, fail):  # type: ignore[no-untyped-def]
+        fail("参考音频设置失败")
+        return False
+
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_service_available", lambda *_args: True)
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_character_model", lambda *_args: True)
+    monkeypatch.setattr(GenieTTSProvider, "_ensure_reference_audio", fake_reference)
+
+    ok, message = GenieTTSProvider.ensure_ready(provider)
+
+    assert not ok
+    assert "参考音频设置失败" in message
 
 
 def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monkeypatch) -> None:  # type: ignore[no-untyped-def]

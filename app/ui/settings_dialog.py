@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -68,13 +69,21 @@ from app.agent.proactive_care import (
 from app.voice.tts import (
     DEFAULT_GENIE_TTS_API_URL,
     DEFAULT_GPT_SOVITS_API_URL,
+    GenieTTSProvider,
+    GPTSoVITSTTSProvider,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
     TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS,
     GPTSoVITSTTSSettings,
     TTSConfigError,
 )
 from app.ui.tts_bundle_dialog import TTSBundleDownloadDialog
+from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
 from sdk.types import ToolsTabContribution
+
+
+MEMORY_READING_TEXT = "正在读取长期记忆..."
+MEMORY_DEPENDENCY_LOADING_TEXT = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
 
 
 class ApiConnectionTestWorker(QObject):
@@ -95,6 +104,39 @@ class ApiConnectionTestWorker(QObject):
         else:
             self.succeeded.emit(message)
         finally:
+            self.finished.emit()
+
+
+class TTSTestWorker(QObject):
+    succeeded = Signal(object, str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+        super().__init__()
+        self.settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        provider = None
+        try:
+            provider = (
+                GenieTTSProvider(self.settings)
+                if self.settings.provider == TTS_PROVIDER_GENIE
+                else GPTSoVITSTTSProvider(self.settings)
+            )
+            ok, message = provider.ensure_ready()
+            if ok:
+                self.succeeded.emit(provider.settings, message)
+            else:
+                self.failed.emit(message)
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        finally:
+            if provider is not None:
+                close = getattr(provider, "close", None)
+                if callable(close):
+                    close()
             self.finished.emit()
 
 
@@ -191,6 +233,10 @@ class SettingsDialog(QDialog):
         self.result_debug_log_settings: DebugLogSettings | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
+        self._tts_test_thread: QThread | None = None
+        self._tts_test_worker: TTSTestWorker | None = None
+        self._pending_accept_values: dict[str, object] | None = None
+        self._save_button_text: str | None = None
         self._memory_list_thread: QThread | None = None
         self._memory_list_worker: MemoryListWorker | None = None
         self._character_export_thread: QThread | None = None
@@ -430,8 +476,9 @@ class SettingsDialog(QDialog):
         self.tts_enabled_check.setChecked(settings.enabled)
 
         self.tts_provider_combo = QComboBox(tab)
-        self.tts_provider_combo.addItem("GPT-SoVITS（GPU）", TTS_PROVIDER_GPT_SOVITS)
-        self.tts_provider_combo.addItem("Genie TTS（CPU）", TTS_PROVIDER_GENIE)
+        self.tts_provider_combo.addItem("GPT-SoVITS 整合包（GPU）", TTS_PROVIDER_GPT_SOVITS)
+        self.tts_provider_combo.addItem("Genie TTS 整合包（CPU）", TTS_PROVIDER_GENIE)
+        self.tts_provider_combo.addItem("自定义外部 GPT-SoVITS", TTS_PROVIDER_CUSTOM_GPT_SOVITS)
         provider_index = self.tts_provider_combo.findData(settings.provider)
         self.tts_provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
 
@@ -441,7 +488,7 @@ class SettingsDialog(QDialog):
         self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_nvidia50/GPT-SoVITS-v2pro-20250604-nvidia50")
         self.tts_bundle_download_button = QPushButton("一键下载 TTS 整合包", tab)
         self.tts_bundle_download_button.clicked.connect(self._download_gpt_sovits_bundle)
-        self.tts_provider_combo.currentIndexChanged.connect(lambda _index: self._sync_tts_provider_controls())
+        self.tts_provider_combo.currentIndexChanged.connect(lambda _index: self._sync_tts_provider_controls(apply_defaults=True))
 
         self.ref_lang_edit = QLineEdit(settings.ref_lang, tab)
         self.text_lang_edit = QLineEdit(settings.text_lang, tab)
@@ -463,7 +510,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("文本语言", self.text_lang_edit)
         form_layout.addRow("超时", self.tts_timeout_spin)
         tab.setLayout(form_layout)
-        self._sync_tts_provider_controls()
+        self._sync_tts_provider_controls(apply_defaults=_is_bundled_tts_provider(settings.provider))
         return tab
 
     def _build_privacy_tab(
@@ -608,7 +655,7 @@ class SettingsDialog(QDialog):
 
         self.memory_refresh_button = QPushButton("刷新", tab)
         self.memory_refresh_button.clicked.connect(self._load_memory_entries)
-        self.memory_status_label = QLabel("正在加载长期记忆...", tab)
+        self.memory_status_label = QLabel(MEMORY_READING_TEXT, tab)
         self.memory_status_label.setStyleSheet("color: #9b4f72;")
 
         self.memory_table = QTableWidget(0, 4, tab)
@@ -692,7 +739,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.memory_editor_container)
         tab.setLayout(layout)
 
-        self._show_memory_placeholder("正在加载长期记忆...")
+        self._show_memory_placeholder(MEMORY_READING_TEXT)
         self._clear_memory_editor()
         self._load_memory_entries()
         return tab
@@ -704,9 +751,10 @@ class SettingsDialog(QDialog):
             self._memory_reload_pending = True
             return
 
-        self.memory_status_label.setText("正在加载长期记忆...")
+        loading_text = self._memory_loading_text()
+        self.memory_status_label.setText(loading_text)
         self.memory_refresh_button.setEnabled(False)
-        self._show_memory_placeholder("正在加载长期记忆...")
+        self._show_memory_placeholder(loading_text)
 
         thread = QThread(self)
         worker = MemoryListWorker(self.memory_store, limit=200)
@@ -722,6 +770,17 @@ class SettingsDialog(QDialog):
         self._memory_list_thread = thread
         self._memory_list_worker = worker
         thread.start()
+
+    def _memory_loading_text(self) -> str:
+        if self.memory_store is None:
+            return MEMORY_READING_TEXT
+        needs_download = getattr(self.memory_store, "needs_embedding_model_download", None)
+        if not callable(needs_download):
+            return MEMORY_READING_TEXT
+        try:
+            return MEMORY_DEPENDENCY_LOADING_TEXT if bool(needs_download()) else MEMORY_READING_TEXT
+        except Exception:  # UI 状态提示不能阻断记忆列表加载。
+            return MEMORY_READING_TEXT
 
     @Slot(list)
     def _handle_memory_load_success(self, memories: list[dict[str, object]]) -> None:
@@ -1157,55 +1216,113 @@ class SettingsDialog(QDialog):
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
             return
+        if self._tts_test_thread is not None:
+            QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再保存设置。")
+            return
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再保存设置。")
             return
 
+        accept_values = self._collect_accept_values()
+        if accept_values is None:
+            return
+        tts_settings = accept_values["tts_settings"]
+        if isinstance(tts_settings, GPTSoVITSTTSSettings) and tts_settings.enabled:
+            self._start_tts_settings_test(tts_settings, accept_values)
+            return
+
+        self._complete_accept(accept_values)
+
+    def _collect_accept_values(self) -> dict[str, object] | None:
         api_settings = self._validated_api_settings()
         if api_settings is None:
-            return
+            return None
         tts_settings = self._validated_tts_settings()
         if tts_settings is None:
-            return
+            return None
         character_id = self._selected_character_id()
         if character_id is None:
             QMessageBox.warning(self, "配置无效", "请先导入并选择一个角色包。")
+            return None
+
+        subtitle_typing_interval_ms, reply_segment_pause_ms = normalize_subtitle_display_speed(
+            self.subtitle_typing_interval_spin.value(),
+            self.reply_segment_pause_spin.value(),
+        )
+        return {
+            "api_settings": api_settings,
+            "tts_settings": tts_settings,
+            "character_id": character_id,
+            "portrait_scale_percent": self._selected_portrait_scale_percent(),
+            "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
+            "reply_segment_pause_ms": reply_segment_pause_ms,
+            "proactive_care_settings": ProactiveCareSettings(
+                enabled=self.proactive_screen_context_enabled_check.isChecked(),
+                screen_context_enabled=self.proactive_screen_context_enabled_check.isChecked(),
+                check_interval_minutes=self.proactive_check_interval_spin.value(),
+                cooldown_minutes=self.proactive_cooldown_spin.value(),
+                screen_context_batch_limit=self.proactive_batch_limit_spin.value(),
+            ),
+            "mcp_settings": MCPRuntimeSettings(
+                windows_enabled=self.windows_mcp_enabled_check.isChecked(),
+            ),
+            "debug_log_settings": DebugLogSettings(
+                enabled=self.debug_log_enabled_check.isChecked(),
+                body_enabled=(
+                    self.debug_log_enabled_check.isChecked()
+                    and self.debug_body_enabled_check.isChecked()
+                ),
+                file_enabled=self.debug_file_enabled_check.isChecked(),
+            ),
+        }
+
+    def _complete_accept(self, values: dict[str, object]) -> None:
+        api_settings = values["api_settings"]
+        tts_settings = values["tts_settings"]
+        character_id = values["character_id"]
+        portrait_scale_percent = values["portrait_scale_percent"]
+        subtitle_typing_interval_ms = values["subtitle_typing_interval_ms"]
+        reply_segment_pause_ms = values["reply_segment_pause_ms"]
+        proactive_care_settings = values["proactive_care_settings"]
+        mcp_settings = values["mcp_settings"]
+        debug_log_settings = values["debug_log_settings"]
+
+        if not isinstance(api_settings, ApiSettings):
+            return
+        if not isinstance(tts_settings, GPTSoVITSTTSSettings):
+            return
+        if not isinstance(character_id, str):
+            return
+        if not isinstance(portrait_scale_percent, int):
+            return
+        if not isinstance(subtitle_typing_interval_ms, int):
+            return
+        if not isinstance(reply_segment_pause_ms, int):
+            return
+        if not isinstance(proactive_care_settings, ProactiveCareSettings):
+            return
+        if not isinstance(mcp_settings, MCPRuntimeSettings):
+            return
+        if not isinstance(debug_log_settings, DebugLogSettings):
             return
 
         self.result_api_settings = api_settings
         self.result_tts_settings = tts_settings
         self.result_character_id = character_id
-        self.result_portrait_scale_percent = self._selected_portrait_scale_percent()
-        (
-            self.result_subtitle_typing_interval_ms,
-            self.result_reply_segment_pause_ms,
-        ) = normalize_subtitle_display_speed(
-            self.subtitle_typing_interval_spin.value(),
-            self.reply_segment_pause_spin.value(),
-        )
-        self.result_proactive_care_settings = ProactiveCareSettings(
-            enabled=self.proactive_screen_context_enabled_check.isChecked(),
-            screen_context_enabled=self.proactive_screen_context_enabled_check.isChecked(),
-            check_interval_minutes=self.proactive_check_interval_spin.value(),
-            cooldown_minutes=self.proactive_cooldown_spin.value(),
-            screen_context_batch_limit=self.proactive_batch_limit_spin.value(),
-        )
-        self.result_mcp_settings = MCPRuntimeSettings(
-            windows_enabled=self.windows_mcp_enabled_check.isChecked(),
-        )
-        self.result_debug_log_settings = DebugLogSettings(
-            enabled=self.debug_log_enabled_check.isChecked(),
-            body_enabled=(
-                self.debug_log_enabled_check.isChecked()
-                and self.debug_body_enabled_check.isChecked()
-            ),
-            file_enabled=self.debug_file_enabled_check.isChecked(),
-        )
+        self.result_portrait_scale_percent = portrait_scale_percent
+        self.result_subtitle_typing_interval_ms = subtitle_typing_interval_ms
+        self.result_reply_segment_pause_ms = reply_segment_pause_ms
+        self.result_proactive_care_settings = proactive_care_settings
+        self.result_mcp_settings = mcp_settings
+        self.result_debug_log_settings = debug_log_settings
         super().accept()
 
     def reject(self) -> None:
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
+            return
+        if self._tts_test_thread is not None:
+            QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再关闭设置。")
             return
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
@@ -1213,6 +1330,10 @@ class SettingsDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event):  # type: ignore[no-untyped-def]
+        if self._tts_test_thread is not None:
+            QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再关闭设置。")
+            event.ignore()
+            return
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
             event.ignore()
@@ -1257,6 +1378,86 @@ class SettingsDialog(QDialog):
         self._api_test_thread = None
         self._api_test_worker = None
 
+    def _start_tts_settings_test(
+        self,
+        settings: GPTSoVITSTTSSettings,
+        accept_values: dict[str, object],
+    ) -> None:
+        if self._tts_test_thread is not None:
+            return
+
+        self._pending_accept_values = dict(accept_values)
+        self._set_tts_test_busy(True)
+
+        thread = QThread(self)
+        worker = TTSTestWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_tts_test_success)
+        worker.failed.connect(self._handle_tts_test_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_tts_test_state)
+
+        self._tts_test_thread = thread
+        self._tts_test_worker = worker
+        thread.start()
+
+    @Slot(object, str)
+    def _handle_tts_test_success(
+        self,
+        settings: object,
+        _message: str,
+    ) -> None:
+        accept_values = self._pending_accept_values
+        if accept_values is None:
+            return
+        if isinstance(settings, GPTSoVITSTTSSettings):
+            accept_values["tts_settings"] = settings
+        self._complete_accept(accept_values)
+
+    @Slot(str)
+    def _handle_tts_test_failed(self, message: str) -> None:
+        accept_values = self._pending_accept_values
+        if accept_values is None:
+            return
+        original_settings = accept_values.get("tts_settings")
+        if not isinstance(original_settings, GPTSoVITSTTSSettings):
+            return
+
+        QMessageBox.warning(
+            self,
+            "TTS 检测失败",
+            f"{message}\n\n已自动关闭 TTS，并继续保存其他设置。",
+        )
+        self.tts_enabled_check.setChecked(False)
+        accept_values["tts_settings"] = replace(original_settings, enabled=False)
+        self._complete_accept(accept_values)
+
+    @Slot()
+    def _reset_tts_test_state(self) -> None:
+        self._tts_test_thread = None
+        self._tts_test_worker = None
+        self._pending_accept_values = None
+        self._set_tts_test_busy(False)
+
+    def _set_tts_test_busy(self, busy: bool) -> None:
+        if not hasattr(self, "button_box"):
+            return
+        save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        cancel_button = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if save_button is not None:
+            if busy:
+                self._save_button_text = save_button.text()
+                save_button.setText("检测 TTS...")
+            elif self._save_button_text is not None:
+                save_button.setText(self._save_button_text)
+                self._save_button_text = None
+            save_button.setEnabled(not busy)
+        if cancel_button is not None:
+            cancel_button.setEnabled(not busy)
+
     def _download_gpt_sovits_bundle(self) -> None:
         dialog = TTSBundleDownloadDialog(self.base_dir, self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.downloaded_work_dir is None:
@@ -1268,15 +1469,29 @@ class SettingsDialog(QDialog):
         self.tts_work_dir_edit.setText(str(dialog.downloaded_work_dir))
         self.tts_api_url_edit.setText(_default_tts_api_url(provider))
         self.tts_enabled_check.setChecked(True)
+        self._sync_tts_provider_controls()
 
     @Slot()
-    def _sync_tts_provider_controls(self) -> None:
+    def _sync_tts_provider_controls(self, *, apply_defaults: bool = False) -> None:
         provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
         self.tts_api_url_edit.setPlaceholderText(_default_tts_api_url(provider))
         if provider == TTS_PROVIDER_GENIE:
             self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/genie_tts_server/Genie-TTS Server")
+        elif provider == TTS_PROVIDER_CUSTOM_GPT_SOVITS:
+            self.tts_work_dir_edit.setPlaceholderText("外部 GPT-SoVITS 工作目录，可留空")
         else:
             self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_nvidia50/GPT-SoVITS-v2pro-20250604-nvidia50")
+        bundled = _is_bundled_tts_provider(provider)
+        self.tts_api_url_edit.setReadOnly(bundled)
+        self.tts_work_dir_edit.setReadOnly(bundled)
+        if bundled and apply_defaults:
+            self.tts_api_url_edit.setText(_default_tts_api_url(provider))
+            work_dir = default_provider_bundle_work_dir(provider, self.base_dir)
+            self.tts_work_dir_edit.setText(str(work_dir or ""))
+        elif provider == TTS_PROVIDER_CUSTOM_GPT_SOVITS and apply_defaults:
+            work_dir = _optional_path(self.tts_work_dir_edit.text(), self.base_dir)
+            if work_dir is not None and is_provider_bundle_work_dir(work_dir, self.base_dir):
+                self.tts_work_dir_edit.clear()
 
     def _import_character_archive(self) -> None:
         if self._character_export_thread is not None:
@@ -1507,6 +1722,10 @@ def _is_http_url(url: str) -> bool:
 
 def _default_tts_api_url(provider: str) -> str:
     return DEFAULT_GENIE_TTS_API_URL if provider == TTS_PROVIDER_GENIE else DEFAULT_GPT_SOVITS_API_URL
+
+
+def _is_bundled_tts_provider(provider: str) -> bool:
+    return provider in {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_GENIE}
 
 
 def _default_genie_onnx_dir(base_dir: Path, profile: CharacterProfile | None) -> Path:

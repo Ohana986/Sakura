@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.voice import tts_bundle
-from app.voice.tts_bundle import GPUInfo, TTSBundleEntry, cleanup_stale_download_archives, download_and_extract_bundle
+from app.voice.tts_bundle import (
+    GPUInfo,
+    TTSBundleEntry,
+    cleanup_stale_download_archives,
+    default_provider_bundle_work_dir,
+    download_and_extract_bundle,
+)
 
 
 class FakeResponse:
@@ -182,6 +188,23 @@ def test_tts_bundle_legacy_cleanup_preserves_uninstalled_and_unknown_archives() 
     assert cleaned == []
     assert archive.exists()
     assert unknown_archive.exists()
+
+
+def test_tts_bundle_default_provider_work_dir_uses_installed_root() -> None:
+    root = _runtime_root("default_provider_work_dir")
+    work_dir = (
+        root
+        / "data"
+        / "tts_bundles"
+        / "installed"
+        / tts_bundle.GPT_SOVITS_NVIDIA50.key
+        / "GPT-SoVITS-v2pro-20250604-nvidia50"
+    )
+    runtime_python = work_dir / "runtime" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("fake", encoding="utf-8")
+
+    assert default_provider_bundle_work_dir("gpt-sovits", root) == work_dir.resolve()
 
 
 def test_tts_bundle_recommends_genie_for_cpu_or_small_gpu() -> None:

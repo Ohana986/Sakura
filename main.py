@@ -77,6 +77,7 @@ def main() -> int:
         return 1
 
     pet_window = PetWindow(context)
+    app.aboutToQuit.connect(pet_window.close_external_tools)
     pet_window.show()
     QTimer.singleShot(0, lambda: _start_deferred_startup(BASE_DIR, pet_window))
 

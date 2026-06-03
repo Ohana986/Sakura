@@ -17,6 +17,7 @@ from app.agent.proactive_care import (
 from app.voice.tts import (
     DEFAULT_GENIE_TTS_API_URL,
     DEFAULT_GPT_SOVITS_API_URL,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
     TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS,
     TTS_PROVIDER_NONE,
@@ -100,6 +101,18 @@ class AppSettingsService:
         elif provider in {"gpt-sovits", "gpt_sovits", "gptsovits"}:
             enabled = True
             provider = TTS_PROVIDER_GPT_SOVITS
+        elif provider in {
+            "custom-gpt-sovits",
+            "custom_gpt_sovits",
+            "custom-sovits",
+            "custom_sovits",
+            "external-gpt-sovits",
+            "external_gpt_sovits",
+            "external-sovits",
+            "external_sovits",
+        }:
+            enabled = True
+            provider = TTS_PROVIDER_CUSTOM_GPT_SOVITS
         elif provider in {"genie", "genie-tts", "genie_tts"}:
             enabled = True
             provider = TTS_PROVIDER_GENIE
@@ -165,7 +178,11 @@ class AppSettingsService:
     def save_tts_settings(self, settings: GPTSoVITSTTSSettings) -> None:
         data = load_yaml_mapping(self.api_config_path)
         saved_provider = settings.provider if settings.enabled else TTS_PROVIDER_NONE
-        section_provider = settings.provider if settings.provider in {TTS_PROVIDER_GENIE, TTS_PROVIDER_GPT_SOVITS} else TTS_PROVIDER_GPT_SOVITS
+        section_provider = (
+            settings.provider
+            if settings.provider in {TTS_PROVIDER_GENIE, TTS_PROVIDER_GPT_SOVITS}
+            else TTS_PROVIDER_GPT_SOVITS
+        )
         tts_data: dict[str, object] = {
             "provider": saved_provider,
             "enabled": bool(settings.enabled),

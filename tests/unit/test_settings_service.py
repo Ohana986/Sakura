@@ -8,7 +8,7 @@ from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
 from app.agent.proactive_care import ProactiveCareSettings
-from app.voice.tts import GPTSoVITSTTSSettings
+from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, GPTSoVITSTTSSettings
 
 
 class CharacterRegistryStub:
@@ -167,6 +167,35 @@ def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
     assert loaded.work_dir == root / "data" / "tts_bundles" / "installed" / "genie_tts_server"
     assert loaded.onnx_model_dir == root / "data" / "tts_bundles" / "onnx" / "sakura"
     assert loaded.timeout_seconds == 33
+
+
+def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
+    root = _runtime_root("yaml_custom_gpt_sovits")
+    service = AppSettingsService(root)
+    settings = GPTSoVITSTTSSettings(
+        enabled=True,
+        provider=TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+        api_url="http://192.168.1.20:9880/tts",
+        ref_audio_path=root / "ref.wav",
+        ref_text_path=root / "ref.txt",
+        ref_text="hello",
+        work_dir=root / "external" / "GPT-SoVITS",
+        ref_lang="ja",
+        text_lang="ja",
+        timeout_seconds=44,
+    )
+
+    service.save_tts_settings(settings)
+    saved = load_yaml_mapping(service.api_config_path)
+    loaded = service.load_tts_settings(validate_enabled=False)
+
+    assert saved["tts"]["provider"] == TTS_PROVIDER_CUSTOM_GPT_SOVITS
+    assert saved["tts"]["gpt_sovits"]["api_url"] == "http://192.168.1.20:9880/tts"
+    assert saved["tts"]["gpt_sovits"]["work_dir"] == "external/GPT-SoVITS"
+    assert loaded.provider == TTS_PROVIDER_CUSTOM_GPT_SOVITS
+    assert loaded.api_url == "http://192.168.1.20:9880/tts"
+    assert loaded.work_dir == root / "external" / "GPT-SoVITS"
+    assert loaded.timeout_seconds == 44
 
 
 def test_settings_service_loads_debug_log_settings() -> None:

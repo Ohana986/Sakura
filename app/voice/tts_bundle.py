@@ -169,6 +169,45 @@ def recommend_tts_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry:
     return GPT_SOVITS_STANDARD
 
 
+def default_bundle_work_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
+    """返回整合包对应的工作目录；已安装时解析真实解压根目录，未安装时返回预期目录。"""
+
+    installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
+    if installed_dir.is_dir():
+        try:
+            return _resolve_extracted_root(installed_dir)
+        except OSError:
+            pass
+    return installed_dir / Path(entry.filename).stem
+
+
+def default_provider_bundle_work_dir(provider: str, base_dir: Path) -> Path | None:
+    """按 provider 选择整合包默认工作目录，自定义外部 provider 不返回目录。"""
+
+    normalized = provider.strip().lower().replace("_", "-")
+    if normalized in {"genie", "genie-tts", "genietts"}:
+        return default_bundle_work_dir(GENIE_TTS, base_dir)
+    if normalized not in {"gpt-sovits", "gpt-so-vits", "gptsovits"}:
+        return None
+
+    for entry in GPT_SOVITS_BUNDLES:
+        installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
+        if _is_installed_bundle_ready(installed_dir):
+            return default_bundle_work_dir(entry, base_dir)
+    recommended = recommend_gpt_sovits_bundle()
+    return default_bundle_work_dir(recommended, base_dir)
+
+
+def is_provider_bundle_work_dir(path: Path, base_dir: Path) -> bool:
+    """判断路径是否位于内置 TTS 整合包安装目录下。"""
+
+    try:
+        path.resolve().relative_to((base_dir / "data" / "tts_bundles" / "installed").resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def download_and_extract_bundle(
     entry: TTSBundleEntry,
     base_dir: Path,

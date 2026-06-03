@@ -4,6 +4,7 @@ import array
 import base64
 import json
 import math
+import os
 import re
 import socket
 import subprocess
@@ -34,10 +35,15 @@ _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 _CJK_TEXT_LANGS = {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"}
 TTS_PROVIDER_NONE = "none"
 TTS_PROVIDER_GPT_SOVITS = "gpt-sovits"
+TTS_PROVIDER_CUSTOM_GPT_SOVITS = "custom-gpt-sovits"
 TTS_PROVIDER_GENIE = "genie-tts"
 DEFAULT_GPT_SOVITS_API_URL = "http://127.0.0.1:9880/tts"
 DEFAULT_GENIE_TTS_API_URL = "http://127.0.0.1:9881/"
-_SUPPORTED_TTS_PROVIDERS = {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_GENIE}
+_SUPPORTED_TTS_PROVIDERS = {
+    TTS_PROVIDER_GPT_SOVITS,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+    TTS_PROVIDER_GENIE,
+}
 
 
 @dataclass
@@ -62,6 +68,46 @@ class _TTSRequest:
     on_started: TTSCallback | None = None
     on_finished: TTSCallback | None = None
     prepared_audio: TTSPreparedAudio | None = None
+
+
+class _LocalProcessHandle(Protocol):
+    pid: int
+
+    def poll(self) -> int | None:
+        """返回本地 TTS 进程是否仍在运行。"""
+
+    def terminate(self) -> None:
+        """终止本地 TTS 进程。"""
+
+    def kill(self) -> None:
+        """强制终止本地 TTS 进程。"""
+
+    def wait(self, timeout: int | float | None = None) -> int | None:
+        """等待本地 TTS 进程退出。"""
+
+
+class _AttachedLocalProcess:
+    """把启动前已存在的本地 TTS 进程纳入关闭流程。"""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def poll(self) -> int | None:
+        return None if _process_exists(self.pid) else 0
+
+    def terminate(self) -> None:
+        _terminate_pid_tree(self.pid, timeout=5)
+
+    def kill(self) -> None:
+        _terminate_pid_tree(self.pid, timeout=5)
+
+    def wait(self, timeout: int | float | None = None) -> int | None:
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(["pid", str(self.pid)], timeout)
+            time.sleep(0.1)
+        return 0
 
 
 class TTSProvider(Protocol):
@@ -90,6 +136,9 @@ class TTSProvider(Protocol):
 
     def warm_up_playback(self) -> None:
         """提前初始化本地播放器，避免第一句朗读承担冷启动成本。"""
+
+    def ensure_ready(self) -> tuple[bool, str]:
+        """同步检测并预热 TTS 服务，不生成或播放音频。"""
 
     def close(self) -> None:
         """释放 Provider 自己启动的本地服务。"""
@@ -149,6 +198,10 @@ class NullTTSProvider:
 
     def warm_up_playback(self) -> None:
         debug_log("TTS", "静音 Provider 跳过播放器预热")
+
+    def ensure_ready(self) -> tuple[bool, str]:
+        debug_log("TTS", "静音 Provider 跳过服务检测")
+        return True, "TTS 已关闭。"
 
     def close(self) -> None:
         debug_log("TTS", "静音 Provider 无需关闭")
@@ -300,7 +353,7 @@ class GPTSoVITSTTSProvider(QObject):
         self._tone_indices: dict[str, int] = {}
         self._weights_ready = False
         self._service_checked = False
-        self._server_process: subprocess.Popen[bytes] | subprocess.Popen[str] | None = None
+        self._server_process: _LocalProcessHandle | None = None
         self._playback_warmup_requested = False
 
         self._audio_output: QAudioOutput | None = None
@@ -439,6 +492,21 @@ class GPTSoVITSTTSProvider(QObject):
             self._failed.emit(f"Qt 多媒体播放器预热失败：{exc}")
         finally:
             self._playback_warmup_requested = False
+
+    def ensure_ready(self) -> tuple[bool, str]:
+        """启动并检测 GPT-SoVITS 服务，同时预加载角色权重。"""
+
+        try:
+            self.settings.validate()
+        except TTSConfigError as exc:
+            return False, str(exc)
+
+        messages: list[str] = []
+        if not self._ensure_service_available(messages.append):
+            return False, messages[-1] if messages else "GPT-SoVITS 服务不可用。"
+        if not self._ensure_character_weights(messages.append):
+            return False, messages[-1] if messages else "GPT-SoVITS 角色权重加载失败。"
+        return True, "TTS 服务已就绪。"
 
     def _queue_request(self, request: _TTSRequest) -> None:
         with self._request_lock:
@@ -620,6 +688,7 @@ class GPTSoVITSTTSProvider(QObject):
 
         timeout = min(self.settings.timeout_seconds, 3)
         if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout):
+            GPTSoVITSTTSProvider._adopt_existing_local_service(self, host, port)
             self._service_checked = True
             debug_log("TTS", "服务探测成功", {"api_url": self.settings.api_url})
             return True
@@ -645,6 +714,26 @@ class GPTSoVITSTTSProvider(QObject):
 
         fail_callback(f"GPT-SoVITS 已尝试启动，但端口仍不可用：{self.settings.api_url}")
         return False
+
+    def _adopt_existing_local_service(self, host: str, port: int) -> None:
+        current = getattr(self, "_server_process", None)
+        if current is not None and current.poll() is None:
+            return
+        process = _find_running_local_tts_process(self.settings, port)
+        if process is None:
+            return
+        self._server_process = process
+        debug_log(
+            "TTS",
+            "接管已有本地 TTS 服务进程，退出时将一并清理",
+            {
+                "pid": process.pid,
+                "provider": self.settings.provider,
+                "host": host,
+                "port": port,
+                "work_dir": str(self.settings.work_dir) if self.settings.work_dir is not None else "",
+            },
+        )
 
     def _probe_service_port(self, host: str, port: int, timeout: int) -> bool:
         try:
@@ -1154,6 +1243,24 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
                 self._request_running = False
             self._start_next_request()
 
+    def ensure_ready(self) -> tuple[bool, str]:
+        """启动并检测 Genie TTS 服务，同时预加载角色模型与参考音频。"""
+
+        try:
+            self.settings.validate()
+        except TTSConfigError as exc:
+            return False, str(exc)
+
+        messages: list[str] = []
+        if not self._ensure_service_available(messages.append):
+            return False, messages[-1] if messages else "Genie TTS 服务不可用。"
+        reference = self._select_reference(DEFAULT_TONE)
+        if not self._ensure_character_model(reference.ref_lang, messages.append):
+            return False, messages[-1] if messages else "Genie TTS 角色模型加载失败。"
+        if not self._ensure_reference_audio(reference, messages.append):
+            return False, messages[-1] if messages else "Genie TTS 参考音频设置失败。"
+        return True, "TTS 服务已就绪。"
+
     def _ensure_service_available(
         self,
         fail_callback: Callable[[str], None],
@@ -1178,6 +1285,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         timeout = min(self.settings.timeout_seconds, 3)
         if GenieTTSProvider._probe_service_port(self, host, port, timeout):
             if GenieTTSProvider._probe_genie_api(self, timeout):
+                GenieTTSProvider._adopt_existing_local_service(self, host, port)
                 self._service_checked = True
                 debug_log("TTS", "Genie 服务探测成功", {"api_url": self.settings.api_url})
                 return True
@@ -1200,6 +1308,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
                 GenieTTSProvider._probe_service_port(self, host, port, timeout)
                 and GenieTTSProvider._probe_genie_api(self, timeout)
             ):
+                GenieTTSProvider._adopt_existing_local_service(self, host, port)
                 self._service_checked = True
                 debug_log("TTS", "Genie 备用端口已有可用服务", {"api_url": self.settings.api_url})
                 return True
@@ -1425,19 +1534,177 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         return self.settings.character_name.strip() or "sakura"
 
 
-def _terminate_process_tree(process: subprocess.Popen[object], timeout: int) -> None:
+def _find_running_local_tts_process(
+    settings: GPTSoVITSTTSSettings,
+    port: int,
+) -> _AttachedLocalProcess | None:
+    if sys.platform != "win32" or settings.work_dir is None:
+        return None
+    if settings.provider not in {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_GENIE}:
+        return None
+
+    pid = _find_listening_tcp_pid(port)
+    if pid is None or pid == os.getpid():
+        return None
+
+    command_line = _query_windows_process_command_line(pid)
+    if not command_line or not _command_line_matches_local_tts(settings, command_line, port):
+        return None
+    return _AttachedLocalProcess(pid)
+
+
+def _find_listening_tcp_pid(port: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
+            **_windows_no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        debug_log("TTS", "查询本地监听端口失败", {"port": port, "error": str(exc)})
+        return None
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        state = parts[-2].upper()
+        if state != "LISTENING" or _netstat_address_port(parts[1]) != port:
+            continue
+        try:
+            return int(parts[-1])
+        except ValueError:
+            return None
+    return None
+
+
+def _netstat_address_port(address: str) -> int | None:
+    if address.startswith("["):
+        _host, separator, port_text = address.rpartition("]:")
+    else:
+        _host, separator, port_text = address.rpartition(":")
+    if not separator:
+        return None
+    try:
+        return int(port_text)
+    except ValueError:
+        return None
+
+
+def _query_windows_process_command_line(pid: int) -> str | None:
+    script = f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\").CommandLine"
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
+            **_windows_no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        debug_log("TTS", "查询本地 TTS 进程命令行失败", {"pid": pid, "error": str(exc)})
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _command_line_matches_local_tts(
+    settings: GPTSoVITSTTSSettings,
+    command_line: str,
+    port: int,
+) -> bool:
+    work_dir = settings.work_dir
+    if work_dir is None:
+        return False
+
+    normalized_command = _normalize_process_text(command_line)
+    python_exe = _normalize_process_text(str(work_dir.resolve() / "runtime" / "python.exe"))
+    if python_exe not in normalized_command:
+        return False
+
+    if settings.provider == TTS_PROVIDER_GENIE:
+        return "genie_tts.start_server" in normalized_command and f"port={int(port)}" in normalized_command
+
+    if settings.provider == TTS_PROVIDER_GPT_SOVITS:
+        api_script = _normalize_process_text(str(work_dir.resolve() / "api_v2.py"))
+        return api_script in normalized_command
+
+    return False
+
+
+def _normalize_process_text(value: str) -> str:
+    return value.replace("/", "\\").casefold()
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=3,
+                **_windows_no_window_kwargs(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and str(int(pid)) in result.stdout
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid_tree(pid: int, timeout: int) -> None:
+    if sys.platform == "win32":
+        _run_windows_taskkill(pid, timeout)
+        return
+    os.kill(pid, 15)
+
+
+def _run_windows_taskkill(pid: int, timeout: int) -> None:
+    kwargs: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "check": False,
+        "timeout": timeout,
+    }
+    kwargs.update(_windows_no_window_kwargs())
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], **kwargs)
+
+
+def _windows_no_window_kwargs() -> dict[str, object]:
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW")}
+    return {}
+
+
+def _terminate_process_tree(process: _LocalProcessHandle, timeout: int) -> None:
     pid = getattr(process, "pid", None)
     if sys.platform == "win32" and pid is not None:
-        kwargs: dict[str, object] = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "check": False,
-            "timeout": timeout,
-        }
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW")
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], **kwargs)
+            _run_windows_taskkill(pid, timeout)
             process.wait(timeout=timeout)
             if process.poll() is not None:
                 return
@@ -1545,6 +1812,8 @@ def _normalize_tts_provider(provider: str, enabled: bool = True) -> str:
         return TTS_PROVIDER_GPT_SOVITS
     if normalized in {"gpt-so-vits", "gpt-sovits"}:
         return TTS_PROVIDER_GPT_SOVITS
+    if normalized in {"custom-gpt-sovits", "external-gpt-sovits", "custom-sovits", "external-sovits"}:
+        return TTS_PROVIDER_CUSTOM_GPT_SOVITS
     if normalized in {"genie", "genie-tts", "genietts"}:
         return TTS_PROVIDER_GENIE
     if normalized in {"none", "off", "disabled", "不使用"}:
