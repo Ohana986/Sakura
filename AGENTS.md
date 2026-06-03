@@ -14,7 +14,8 @@
 - `third_party/` 和 `tools/mcp/` 中包含第三方或外部工具代码，修改前需确认确实属于当前任务范围。
 
 ## 常用命令
-项目使用 `/runtime/python/python.exe` 的运行环境，以下命令均在该环境下执行：
+
+项目使用 `/runtime/python.exe` 的运行环境，以下命令均在该环境下执行：
 
 ```powershell
 python main.py
