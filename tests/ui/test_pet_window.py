@@ -15,7 +15,12 @@ from app.config.settings_service import DebugLogSettings
 from app.llm.api_client import ApiSettings
 from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
-from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings, build_pet_window_stylesheet
+from app.ui.theme import (
+    DEFAULT_THEME_SETTINGS,
+    ThemeSettings,
+    build_message_box_stylesheet,
+    build_pet_window_stylesheet,
+)
 from app.agent.proactive_care import ProactiveCareSettings
 from app.agent.screen_observation import ScreenObservation
 from app.voice.tts import GPTSoVITSTTSSettings
@@ -151,6 +156,75 @@ def test_pet_window_status_tray_icon_is_not_empty() -> None:
 
     assert not icon.isNull()
     app.processEvents()
+
+
+def test_memory_status_does_not_use_tray_balloon(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class TrayIconStub:
+        def __init__(self) -> None:
+            self.messages: list[tuple[object, ...]] = []
+
+        def isVisible(self) -> bool:
+            return True
+
+        def showMessage(self, *args) -> None:  # type: ignore[no-untyped-def]
+            self.messages.append(args)
+
+    class SubtitleControllerStub:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def show_text_immediately(self, message: str) -> None:
+            self.messages.append(message)
+
+    single_shots: list[tuple[int, object]] = []
+    monkeypatch.setattr(
+        pet_window_module.QTimer,
+        "singleShot",
+        lambda delay, callback: single_shots.append((delay, callback)),
+    )
+    window = type("WindowStub", (), {})()
+    window.memory_status_message_active = False
+    window.memory_status_last_message = ""
+    window.startup_initializing = False
+    window.active_interaction_id = None
+    window.reply_history_review_active = False
+    window.subtitle_controller = SubtitleControllerStub()
+    window.tray_icon = TrayIconStub()
+    window._restore_memory_status_speech = lambda: None
+
+    for status in ("loading", "reloading", "failed"):
+        PetWindow._show_memory_status_message(window, status, f"{status} message")
+    PetWindow._show_memory_ready_message(window, "ready message")
+
+    assert window.tray_icon.messages == []
+    assert window.subtitle_controller.messages == [
+        "loading message",
+        "reloading message",
+        "failed message",
+    ]
+    assert single_shots == [(pet_window_module.MEMORY_STATUS_DISPLAY_MS, window._restore_memory_status_speech)]
+
+
+def test_message_box_stylesheet_contains_configured_theme_colors() -> None:
+    theme = ThemeSettings(
+        primary_color="#112233",
+        primary_hover_color="#223344",
+        accent_color="#334455",
+        text_color="#445566",
+        page_background_color="#ddeeff",
+        border_color="#556677",
+    )
+
+    stylesheet = build_message_box_stylesheet(theme)
+
+    assert "#112233" in stylesheet
+    assert "#223344" in stylesheet
+    assert "#334455" in stylesheet
+    assert "#445566" in stylesheet
+    assert "#ddeeff" in stylesheet
 
 
 def test_pet_window_hide_and_show_to_tray_tracks_hidden_state() -> None:
@@ -2603,7 +2677,7 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
         MemoryStoreStub(),
     )
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
-    monkeypatch.setattr(pet_window_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
 
     window.show_settings()
 
@@ -2676,7 +2750,7 @@ def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> 
         MemoryStoreStub(),
     )
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
-    monkeypatch.setattr(pet_window_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
 
     window.show_settings()
 
@@ -2722,8 +2796,12 @@ def test_history_clear_keeps_history_when_memory_curation_returns_nothing(monkey
     window.memory_curation_state = MemoryCurationStateStub()
     window.history_window = None
 
-    monkeypatch.setattr(pet_window_module.QMessageBox, "warning", lambda _parent, title, text: warnings.append((title, text)))
-    monkeypatch.setattr(pet_window_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        pet_window_module,
+        "show_themed_warning",
+        lambda _parent, title, text: warnings.append((title, text)),
+    )
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
 
     window._handle_memory_curation_finished(
         MemoryCurationResult(ignored=3, processed_entries=3, returned=0)
@@ -2803,9 +2881,9 @@ def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch
     )
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
     monkeypatch.setattr(
-        pet_window_module.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: messages.append(str(_args[2])),
+        pet_window_module,
+        "show_themed_information",
+        lambda _parent, _title, text, **_kwargs: messages.append(str(text)),
     )
 
     window.show_settings()
@@ -2895,7 +2973,7 @@ def test_show_settings_uses_dialog_refreshed_character_registry(monkeypatch) -> 
         MemoryStoreStub(),
     )
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
-    monkeypatch.setattr(pet_window_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
 
     window.show_settings()
 

@@ -537,6 +537,43 @@ QPushButton:disabled {{
 """
 
 
+def build_message_box_stylesheet(settings: ThemeSettings) -> str:
+    theme = settings.normalized()
+    return f"""
+QMessageBox {{
+    background: {theme.page_background_color};
+    color: {theme.text_color};
+    font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
+    font-size: 14px;
+}}
+QMessageBox QLabel {{
+    color: {theme.text_color};
+    font-size: 14px;
+    line-height: 1.35;
+}}
+QMessageBox QPushButton {{
+    background: {theme.primary_color};
+    border: 1px solid {rgba(theme.accent_color, 140)};
+    border-radius: 8px;
+    color: white;
+    min-width: 76px;
+    padding: 7px 14px;
+    font-weight: 600;
+}}
+QMessageBox QPushButton:hover {{
+    background: {theme.primary_hover_color};
+}}
+QMessageBox QPushButton:pressed {{
+    background: {theme.accent_color};
+}}
+QMessageBox QPushButton:disabled {{
+    background: {rgba(theme.primary_color, 107)};
+    border: 1px solid {rgba(theme.border_color, 115)};
+    color: rgba(255, 255, 255, 0.76);
+}}
+"""
+
+
 def build_history_window_stylesheet(settings: ThemeSettings) -> str:
     theme = settings.normalized()
     return f"""
