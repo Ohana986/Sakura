@@ -2136,9 +2136,13 @@ class SettingsDialog(QDialog):
 
     def _probe_api_models(self) -> None:
         settings = self._validated_api_model_probe_settings()
-        if settings is None or self._api_model_probe_thread is not None or self._api_test_thread is not None:
+        if (
+            settings is None
+            or self._api_model_probe_thread is not None
+            or self._api_test_thread is not None
+            or self._tts_test_thread is not None
+        ):
             return
-
         self._set_api_model_probe_busy(True)
         thread = QThread()
         worker = ApiModelListProbeWorker(settings)
