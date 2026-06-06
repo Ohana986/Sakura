@@ -2974,9 +2974,9 @@ class PetWindow(QWidget):
     def _load_subtitle_language(self) -> str:
         system_values = self._load_system_config_values("ui")
         language = str(system_values.get("subtitle_language", "")).strip().lower()
-        if language == SUBTITLE_LANGUAGE_ZH:
-            return SUBTITLE_LANGUAGE_ZH
-        return SUBTITLE_LANGUAGE_JA
+        if language == SUBTITLE_LANGUAGE_JA:
+            return SUBTITLE_LANGUAGE_JA
+        return SUBTITLE_LANGUAGE_ZH
 
     def _load_portrait_scale_percent(self) -> int:
         system_values = self._load_system_config_values("ui")

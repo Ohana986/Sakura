@@ -739,6 +739,24 @@ def test_stage_size_shrinks_with_portrait_scale_below_default_height() -> None:
         assert width == 860
 
 
+def test_pet_window_defaults_subtitle_language_to_chinese() -> None:
+    from app.ui.pet_window import PetWindow, SUBTITLE_LANGUAGE_JA, SUBTITLE_LANGUAGE_ZH
+
+    class MinimalWindow:
+        _load_subtitle_language = PetWindow._load_subtitle_language
+
+        def __init__(self, values):  # type: ignore[no-untyped-def]
+            self.values = values
+
+        def _load_system_config_values(self, section: str):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            return self.values
+
+    assert MinimalWindow({})._load_subtitle_language() == SUBTITLE_LANGUAGE_ZH
+    assert MinimalWindow({"subtitle_language": "ja"})._load_subtitle_language() == SUBTITLE_LANGUAGE_JA
+    assert MinimalWindow({"subtitle_language": "invalid"})._load_subtitle_language() == SUBTITLE_LANGUAGE_ZH
+
+
 def test_pet_window_loads_normalized_subtitle_display_speed() -> None:
     from app.ui.pet_window import PetWindow
 
