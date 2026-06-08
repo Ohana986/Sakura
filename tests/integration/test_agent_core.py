@@ -383,6 +383,22 @@ def test_memory_store_returns_failed_response_for_nonblocking_memory_tools() -> 
     assert "client has been closed" in result["error"]
 
 
+def test_memory_store_downgrades_closed_client_during_search() -> None:
+    class ClosedClientMemory:
+        def search(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    store = MemoryStore(base_dir=_runtime_root_path("memory_closed_client_search"))
+    store._memory = ClosedClientMemory()
+
+    result = store.search_memory({"query": "偏好"})
+
+    assert result["status"] == "failed"
+    assert "普通聊天仍可继续" in result["message"]
+    assert "client has been closed" in result["error"]
+    assert store._memory is None
+
+
 def test_memory_store_reload_keeps_old_runtime_until_new_runtime_is_ready() -> None:
     old_settings = ApiSettings("https://old.example.com/v1", "old-key", "old-model")
     new_settings = ApiSettings("https://new.example.com/v1", "new-key", "new-model")
@@ -967,6 +983,24 @@ servers:
     assert tool.risk == "medium"
     assert tool.requires_confirmation
     provider.close()
+
+
+def test_mcp_provider_closed_tool_returns_failed_result() -> None:
+    root = _runtime_root_path("mcp_closed_tool")
+    registry = ToolRegistry()
+    provider = MCPToolProvider(
+        load_mcp_config(_write_mcp_config(root, "name_prefix: demo_")),
+        bridge_factory=_FakeMCPBridge,
+    )
+    provider.register_tools(registry)
+    tool = registry.get("demo_echo")
+    assert tool is not None
+
+    provider.close()
+    result = tool.handler({"message": "hello"})
+
+    assert result["isError"] is True
+    assert "连接已关闭" in result["error"]
 
 
 def test_mcp_provider_skips_disabled_server() -> None:
