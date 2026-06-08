@@ -1323,7 +1323,7 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
     app.processEvents()
 
 
-def test_settings_dialog_marks_windows_mcp_as_unavailable() -> None:
+def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -1344,20 +1344,22 @@ def test_settings_dialog_marks_windows_mcp_as_unavailable() -> None:
         base_dir=root,
         **_settings_dialog_character_kwargs(root),
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
-        mcp_settings=MCPRuntimeSettings(windows_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
 
     labels = [label.text() for label in dialog.findChildren(qtwidgets.QLabel)]
 
     assert not dialog.windows_mcp_enabled_check.isChecked()
-    assert not dialog.windows_mcp_enabled_check.isEnabled()
-    assert any("待测试，未开放" in text for text in labels)
+    assert dialog.windows_mcp_enabled_check.isEnabled()
+    assert "实验性" in dialog.windows_mcp_enabled_check.text()
+    assert "实验性功能" in dialog.windows_mcp_enabled_check.toolTip()
+    assert any("实验性功能" in text for text in labels)
     assert any("重启 Sakura" in text for text in labels)
 
     dialog.windows_mcp_enabled_check.setChecked(True)
     dialog.accept()
 
-    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=False)
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
     dialog.deleteLater()
     app.processEvents()
 

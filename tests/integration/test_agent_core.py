@@ -1039,18 +1039,18 @@ servers:
     )
 
     assert config.servers[0].name == "windows"
-    assert not config.servers[0].enabled
+    assert config.servers[0].enabled
 
 
-def test_settings_service_saves_and_loads_windows_mcp_as_disabled() -> None:
+def test_settings_service_saves_and_loads_experimental_windows_mcp() -> None:
     service = AppSettingsService(_runtime_root_path("mcp_runtime_save"))
 
     service.save_mcp_runtime_settings(MCPRuntimeSettings(windows_enabled=True))
 
-    assert not service.load_mcp_runtime_settings().windows_enabled
+    assert service.load_mcp_runtime_settings().windows_enabled
 
 
-def test_register_mcp_tools_skips_unavailable_windows_mcp() -> None:
+def test_register_mcp_tools_loads_experimental_windows_mcp_when_enabled() -> None:
     root = _runtime_root_path("mcp_register_windows_override")
     config_dir = root / "data" / "config"
     config_dir.mkdir(parents=True)
@@ -1075,8 +1075,9 @@ servers:
         runtime_settings=MCPRuntimeSettings(windows_enabled=True),
     )
 
-    assert provider is None
-    assert registry.get("windows__echo") is None
+    assert provider is not None
+    assert registry.get("windows__echo") is not None
+    provider.close()
 
 
 def test_mcp_provider_filters_tools_and_applies_tool_policies() -> None:
