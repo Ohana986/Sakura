@@ -8,9 +8,10 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor
+from PySide6.QtGui import QAction, QBrush, QColor, QPainterPath, QRegion
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -25,6 +26,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QMenu,
     QPushButton,
@@ -49,7 +53,13 @@ from app.config.character_archive import (
     import_character_archive,
     import_character_voice_archive,
 )
-from app.config.settings_service import DebugLogSettings, StartupSettings
+from app.config.settings_service import (
+    BUBBLE_AUTO_HIDE_MAX_DELAY_SECONDS,
+    BUBBLE_AUTO_HIDE_MIN_DELAY_SECONDS,
+    BubbleSettings,
+    DebugLogSettings,
+    StartupSettings,
+)
 from app.platforms.launch_at_login import (
     is_launch_at_login_supported,
     launch_at_login_platform_text,
@@ -106,8 +116,11 @@ from app.voice.tts import (
 from app.ui.tts_bundle_dialog import TTSBundleDownloadDialog
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
+    SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME,
+    SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME,
     THEME_COLOR_FIELDS,
     ThemeSettings,
+    build_app_chrome_stylesheet,
     build_color_button_stylesheet,
     build_settings_dialog_stylesheet,
     normalize_hex_color,
@@ -120,6 +133,25 @@ from sdk.types import SettingsPanelContribution, ToolsTabContribution
 
 MEMORY_READING_TEXT = "正在读取长期记忆..."
 MEMORY_DEPENDENCY_LOADING_TEXT = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
+
+
+def _prepare_combo_popup_view(combo: QComboBox) -> None:
+    # 仍给内置 view 标记对象名，避免 Qt 在补全/辅助绘制路径里回落到默认样式。
+    view = QListView(combo)
+    view.setFrameShape(QFrame.Shape.NoFrame)
+    view.setLineWidth(0)
+    view.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
+    combo.setView(view)
+
+
+def _prepare_popup_menu(menu: QMenu) -> None:
+    # 弹出菜单默认有系统窗口边框/阴影；设置为无边框后由 QSS 绘制自身底色。
+    menu.setWindowFlags(
+        menu.windowFlags()
+        | Qt.WindowType.FramelessWindowHint
+        | Qt.WindowType.NoDropShadowWindowHint
+    )
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
 
 class ApiConnectionTestWorker(QObject):
@@ -164,7 +196,84 @@ class ApiModelListProbeWorker(QObject):
             self.finished.emit()
 
 
-class ModelComboBox(QComboBox):
+class SettingsComboBox(QComboBox):
+    """设置页下拉框，使用自绘无边框弹层避开 Qt 原生矩形容器。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        _prepare_combo_popup_view(self)
+        self._popup_frame: QFrame | None = None
+        self._popup_list: QListWidget | None = None
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt 虚函数命名。
+        if not self.isEnabled() or self.count() <= 0:
+            return
+        popup, popup_list = self._ensure_popup()
+        popup_list.clear()
+        for index in range(self.count()):
+            item = QListWidgetItem(self.itemText(index))
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            popup_list.addItem(item)
+        if self.currentIndex() >= 0:
+            popup_list.setCurrentRow(self.currentIndex())
+
+        row_height = popup_list.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = 28
+        visible_rows = min(max(self.count(), 1), 10)
+        popup_height = row_height * visible_rows + 4
+        bottom_left = self.mapToGlobal(self.rect().bottomLeft())
+        popup.setGeometry(bottom_left.x(), bottom_left.y(), self.width(), popup_height)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, self.width(), popup_height, 7, 7)
+        popup.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        popup.show()
+        popup.raise_()
+        popup_list.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def hidePopup(self) -> None:  # noqa: N802 - Qt 虚函数命名。
+        if self._popup_frame is not None:
+            self._popup_frame.hide()
+
+    def _ensure_popup(self) -> tuple[QFrame, QListWidget]:
+        if self._popup_frame is None or self._popup_list is None:
+            popup = QFrame(
+                self,
+                Qt.WindowType.Popup
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.NoDropShadowWindowHint,
+            )
+            popup.setObjectName(SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME)
+            popup.setFrameShape(QFrame.Shape.NoFrame)
+            popup.setLineWidth(0)
+
+            popup_list = QListWidget(popup)
+            popup_list.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
+            popup_list.setFrameShape(QFrame.Shape.NoFrame)
+            popup_list.setLineWidth(0)
+            popup_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            popup_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            popup_list.itemClicked.connect(self._select_popup_item)
+            popup_list.itemActivated.connect(self._select_popup_item)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(popup_list)
+            popup.setLayout(layout)
+            self._popup_frame = popup
+            self._popup_list = popup_list
+        return self._popup_frame, self._popup_list
+
+    def _select_popup_item(self, item: QListWidgetItem) -> None:
+        index = int(item.data(Qt.ItemDataRole.UserRole))
+        if 0 <= index < self.count():
+            self.setCurrentIndex(index)
+            if self.isEditable():
+                self.setEditText(self.itemText(index))
+        self.hidePopup()
+
+
+class ModelComboBox(SettingsComboBox):
     """可编辑模型选择框，保留 QLineEdit 风格的 text/setText 兼容接口。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -172,6 +281,11 @@ class ModelComboBox(QComboBox):
         self._model_names: list[str] = []
         self._completion_model = QStringListModel(self)
         completer = QCompleter(self._completion_model, self)
+        completion_popup = QListView(self)
+        completion_popup.setFrameShape(QFrame.Shape.NoFrame)
+        completion_popup.setLineWidth(0)
+        completion_popup.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
+        completer.setPopup(completion_popup)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.setEditable(True)
@@ -185,6 +299,7 @@ class ModelComboBox(QComboBox):
         return self.currentText()
 
     def set_model_names(self, model_names: list[str]) -> None:
+        self.hidePopup()
         current_text = self.currentText().strip()
         self._model_names = list(model_names)
         self.blockSignals(True)
@@ -369,11 +484,13 @@ class SettingsDialog(QDialog):
         reply_segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
         theme_settings: ThemeSettings | None = None,
         startup_settings: StartupSettings | None = None,
+        bubble_settings: BubbleSettings | None = None,
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.tts_settings = tts_settings
         self.startup_settings = startup_settings or StartupSettings()
+        self.bubble_settings = bubble_settings or BubbleSettings()
         self._initial_api_settings = api_settings
         self._initial_tts_settings = tts_settings
         self._initial_character_id = current_character.id if current_character is not None else None
@@ -414,6 +531,7 @@ class SettingsDialog(QDialog):
         self.result_mcp_settings: MCPRuntimeSettings | None = None
         self.result_debug_log_settings: DebugLogSettings | None = None
         self.result_startup_settings: StartupSettings | None = None
+        self.result_bubble_settings: BubbleSettings | None = None
         self.result_theme_settings: ThemeSettings | None = None
         self.result_theme_write_mode: Literal["unchanged", "manual", "ai", "reset", "character"] = "unchanged"
         self.result_plugin_config_changed = False
@@ -491,6 +609,7 @@ class SettingsDialog(QDialog):
             self._build_system_tab(
                 debug_log_settings or DebugLogSettings(),
                 self.startup_settings,
+                self.bubble_settings,
             ),
             "系统",
         )
@@ -560,7 +679,7 @@ class SettingsDialog(QDialog):
         current_character: CharacterProfile | None,
     ) -> QWidget:
         tab = QWidget(self)
-        self.character_combo = QComboBox(tab)
+        self.character_combo = SettingsComboBox(tab)
         self.character_empty_label = QLabel("尚未导入角色", tab)
         self._refresh_character_combo(
             current_character.id if current_character is not None else None
@@ -585,6 +704,7 @@ class SettingsDialog(QDialog):
         self.tts_voice_import_button.setToolTip("为当前选中的角色导入单独的 TTS 模型包。")
         self.character_export_button = QPushButton("导出", container)
         self.character_export_menu = QMenu(self.character_export_button)
+        _prepare_popup_menu(self.character_export_menu)
         self.character_export_full_action = QAction("导出完整包 (.char)", self)
         self.character_export_card_action = QAction("导出单角色包 (.char)", self)
         self.character_export_voice_action = QAction("导出语音包 (.voice)", self)
@@ -765,7 +885,7 @@ class SettingsDialog(QDialog):
         self.tts_enabled_check = QCheckBox("启用 TTS 语音", tab)
         self.tts_enabled_check.setChecked(settings.enabled)
 
-        self.tts_provider_combo = QComboBox(tab)
+        self.tts_provider_combo = SettingsComboBox(tab)
         self.tts_provider_combo.addItem("GPT-SoVITS 整合包（GPU）", TTS_PROVIDER_GPT_SOVITS)
         self.tts_provider_combo.addItem("Genie TTS 整合包（CPU）", TTS_PROVIDER_GENIE)
         self.tts_provider_combo.addItem("自定义 GPT-SoVITS（macOS/Linux）", TTS_PROVIDER_CUSTOM_GPT_SOVITS)
@@ -1048,6 +1168,7 @@ class SettingsDialog(QDialog):
         self,
         debug_settings: DebugLogSettings,
         startup_settings: StartupSettings,
+        bubble_settings: BubbleSettings,
     ) -> QWidget:
         tab = QWidget(self)
         self.launch_at_login_check = QCheckBox("登录时自动启动 Sakura", tab)
@@ -1087,6 +1208,19 @@ class SettingsDialog(QDialog):
         self.reply_segment_pause_spin.setSuffix(" 毫秒")
         self.reply_segment_pause_spin.setValue(self.reply_segment_pause_ms)
 
+        self.bubble_auto_hide_check = QCheckBox("气泡无操作后自动隐藏", tab)
+        self.bubble_auto_hide_check.setChecked(bubble_settings.auto_hide_enabled)
+        self.bubble_auto_hide_delay_spin = QSpinBox(tab)
+        self.bubble_auto_hide_delay_spin.setRange(
+            BUBBLE_AUTO_HIDE_MIN_DELAY_SECONDS,
+            BUBBLE_AUTO_HIDE_MAX_DELAY_SECONDS,
+        )
+        self.bubble_auto_hide_delay_spin.setSuffix(" 秒")
+        self.bubble_auto_hide_delay_spin.setValue(
+            bubble_settings.normalized().auto_hide_delay_seconds
+        )
+        self.bubble_auto_hide_check.toggled.connect(self._sync_bubble_auto_hide_controls)
+
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
@@ -1096,6 +1230,10 @@ class SettingsDialog(QDialog):
         form_layout.addRow("", self.debug_file_enabled_check)
         form_layout.addRow("字幕逐字间隔", self.subtitle_typing_interval_spin)
         form_layout.addRow("回复分段停顿", self.reply_segment_pause_spin)
+        form_layout.addRow("", self.bubble_auto_hide_check)
+        form_layout.addRow("气泡无操作时长", self.bubble_auto_hide_delay_spin)
+        self._system_form_layout = form_layout
+        self._sync_bubble_auto_hide_controls(self.bubble_auto_hide_check.isChecked())
         tab.setLayout(form_layout)
         return tab
 
@@ -1109,6 +1247,15 @@ class SettingsDialog(QDialog):
                 self.proactive_cooldown_spin,
                 self.proactive_batch_limit_spin,
             ),
+            enabled,
+        )
+
+    @Slot(bool)
+    def _sync_bubble_auto_hide_controls(self, enabled: bool) -> None:
+        """气泡自动隐藏关闭时，不允许调整无操作时长。"""
+        self._set_form_widgets_enabled(
+            getattr(self, "_system_form_layout", None),
+            (self.bubble_auto_hide_delay_spin,),
             enabled,
         )
 
@@ -1737,6 +1884,7 @@ class SettingsDialog(QDialog):
         theme = settings.normalized()
         self.theme_settings = theme
         self.setStyleSheet(build_settings_dialog_stylesheet(theme))
+        self._apply_app_chrome_stylesheet()
         inline_styles = {
             "theme_status_label": f"color: {theme.muted_text_color};",
             "memory_status_label": f"color: {theme.muted_text_color};",
@@ -1748,6 +1896,12 @@ class SettingsDialog(QDialog):
             widget = getattr(self, attr, None)
             if isinstance(widget, QLabel):
                 widget.setStyleSheet(style)
+
+    def _apply_app_chrome_stylesheet(self) -> None:
+        # QComboBox 弹出列表是独立顶层控件，对话框级样式不会稳定传播到弹层。
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_app_chrome_stylesheet(self.theme_settings))
 
     def _choose_theme_color(self, edit: QLineEdit) -> None:
         current_color = QColor(normalize_hex_color(edit.text(), DEFAULT_THEME_SETTINGS.primary_color))
@@ -2012,6 +2166,10 @@ class SettingsDialog(QDialog):
                     else self.startup_settings.launch_at_login
                 ),
             ),
+            "bubble_settings": BubbleSettings(
+                auto_hide_enabled=self.bubble_auto_hide_check.isChecked(),
+                auto_hide_delay_seconds=self.bubble_auto_hide_delay_spin.value(),
+            ),
         }
 
     def _complete_accept(self, values: dict[str, object]) -> None:
@@ -2026,6 +2184,7 @@ class SettingsDialog(QDialog):
         mcp_settings = values["mcp_settings"]
         debug_log_settings = values["debug_log_settings"]
         startup_settings = values["startup_settings"]
+        bubble_settings = values["bubble_settings"]
 
         if not isinstance(api_settings, ApiSettings):
             return
@@ -2049,6 +2208,8 @@ class SettingsDialog(QDialog):
             return
         if not isinstance(startup_settings, StartupSettings):
             return
+        if not isinstance(bubble_settings, BubbleSettings):
+            return
 
         try:
             plugin_config_changed = self._save_plugin_settings_if_needed()
@@ -2068,6 +2229,7 @@ class SettingsDialog(QDialog):
         self.result_mcp_settings = mcp_settings
         self.result_debug_log_settings = debug_log_settings
         self.result_startup_settings = startup_settings
+        self.result_bubble_settings = bubble_settings
         self.result_plugin_config_changed = plugin_config_changed
         super().accept()
 

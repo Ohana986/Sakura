@@ -19,7 +19,10 @@ from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
+    SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME,
+    SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME,
     ThemeSettings,
+    build_app_chrome_stylesheet,
     build_message_box_stylesheet,
     build_pet_window_stylesheet,
 )
@@ -610,6 +613,13 @@ def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
         def accept(self) -> None:
             self.accepted = True
 
+    class _DragAnimatorStub:
+        def suspend_for_drag(self) -> None:
+            pass
+
+        def resume_after_drag(self) -> None:
+            pass
+
     class MinimalWindow:
         _handle_mouse_press = PetWindow._handle_mouse_press
         _handle_mouse_move = PetWindow._handle_mouse_move
@@ -618,6 +628,8 @@ def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
 
         def __init__(self) -> None:
             self.drag_anchor = None
+            self._dragging = False
+            self.input_bar_animator = _DragAnimatorStub()
             self.move_positions: list[object] = []
 
         def frameGeometry(self):  # type: ignore[no-untyped-def]
@@ -625,6 +637,9 @@ def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
 
         def move(self, position) -> None:  # type: ignore[no-untyped-def]
             self.move_positions.append(position)
+
+        def _finish_drag_resume(self) -> None:
+            pass
 
     window = MinimalWindow()
     press_event = MouseEventStub(position=(40, 60), global_position=(240, 160))
@@ -671,8 +686,15 @@ def test_pet_window_drag_maps_child_widget_anchor_to_window_coordinates() -> Non
             self.accepted = True
 
     class ChildWidgetStub:
-        def mapTo(self, _window, position):  # type: ignore[no-untyped-def]
-            return position + qtcore.QPoint(100, 80)
+        def mapToGlobal(self, position):  # type: ignore[no-untyped-def]
+            return position + qtcore.QPoint(200, 160)
+
+    class _DragAnimatorStub:
+        def suspend_for_drag(self) -> None:
+            pass
+
+        def resume_after_drag(self) -> None:
+            pass
 
     class MinimalWindow:
         _handle_mouse_press = PetWindow._handle_mouse_press
@@ -681,7 +703,12 @@ def test_pet_window_drag_maps_child_widget_anchor_to_window_coordinates() -> Non
 
         def __init__(self) -> None:
             self.drag_anchor = None
+            self._dragging = False
+            self.input_bar_animator = _DragAnimatorStub()
             self.move_positions: list[object] = []
+
+        def mapFromGlobal(self, position):  # type: ignore[no-untyped-def]
+            return position - qtcore.QPoint(100, 80)
 
         def move(self, position) -> None:  # type: ignore[no-untyped-def]
             self.move_positions.append(position)
@@ -1363,13 +1390,16 @@ priority: 10
 
 def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTabWidget")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QTabWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
 
+    Qt = qtcore.Qt
     QApplication = qtwidgets.QApplication
+    QFrame = qtwidgets.QFrame
     QTabWidget = qtwidgets.QTabWidget
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("grouped_settings_tabs")
@@ -1404,6 +1434,8 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert "QComboBox::drop-down" in dialog.styleSheet()
     assert "QComboBox::down-arrow" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView" in dialog.styleSheet()
+    assert f"QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME}" in dialog.styleSheet()
+    assert f"QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView::item:selected" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView::item:selected:!active" in dialog.styleSheet()
     assert "QSpinBox::up-button" in dialog.styleSheet()
@@ -1413,6 +1445,24 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert "QComboBox:disabled" in dialog.styleSheet()
     assert "QSpinBox::up-button:disabled" in dialog.styleSheet()
     assert "QGroupBox QWidget" not in dialog.styleSheet()
+    assert dialog.character_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert dialog.model_edit.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert dialog.model_edit.completer().popup().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert dialog.tts_provider_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert app.styleSheet() == build_app_chrome_stylesheet(dialog.theme_settings)
+
+    dialog.character_combo.showPopup()
+    app.processEvents()
+    popup_container = dialog.character_combo._popup_frame
+    popup_list = dialog.character_combo._popup_list
+    assert popup_container is not None
+    assert popup_list is not None
+    assert popup_container.objectName() == SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME
+    assert popup_container.frameShape() == QFrame.Shape.NoFrame
+    assert bool(popup_container.windowFlags() & Qt.WindowType.FramelessWindowHint)
+    assert bool(popup_container.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
+    assert popup_list.objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    dialog.character_combo.hidePopup()
 
     dialog.deleteLater()
     app.processEvents()
@@ -2200,6 +2250,11 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
 
     assert dialog.model_edit.currentText() == "z-model"
     assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == ["z-model", "a-model"]
+    dialog.model_edit.showPopup()
+    app.processEvents()
+    assert dialog.model_edit._popup_list is not None
+    assert dialog.model_edit._popup_list.count() == 2
+    dialog.model_edit.hidePopup()
     assert infos and "2" in infos[0]
     dialog.deleteLater()
     app.processEvents()
@@ -2460,8 +2515,8 @@ def test_settings_dialog_import_character_archive_refreshes_combo(monkeypatch) -
         "getOpenFileName",
         lambda *_args, **_kwargs: (str(archive_path), ""),
     )
-    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
     warnings: list[str] = []
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         settings_dialog_module.QMessageBox,
         "warning",
@@ -2559,6 +2614,56 @@ def test_pet_window_retires_tts_provider_by_closing_it() -> None:
     assert window.retired_tts_providers == [provider]
 
 
+def test_pet_window_retires_tts_provider_without_stopping_kept_service() -> None:
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class ProviderStub:
+        def detach_local_service(self) -> None:
+            calls.append("detach")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class MinimalWindow:
+        _retire_tts_provider = PetWindow._retire_tts_provider
+
+    window = MinimalWindow()
+    window.retired_tts_providers = []
+    provider = ProviderStub()
+
+    window._retire_tts_provider(provider, keep_local_service=True)
+
+    assert calls == ["detach", "close"]
+    assert window.retired_tts_providers == [provider]
+
+
+def test_tts_local_service_reuse_requires_same_runtime() -> None:
+    from app.ui.pet_window import _should_keep_tts_local_service
+
+    class ProviderStub:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+    root = _ui_runtime_root("tts_local_service_reuse")
+    settings = replace(
+        _minimal_tts_settings(),
+        enabled=True,
+        work_dir=root / "tts" / "g50",
+    )
+
+    assert _should_keep_tts_local_service(ProviderStub(settings), ProviderStub(settings))
+    assert not _should_keep_tts_local_service(
+        ProviderStub(settings),
+        ProviderStub(replace(settings, api_url="http://127.0.0.1:9881/tts")),
+    )
+    assert not _should_keep_tts_local_service(
+        ProviderStub(settings),
+        ProviderStub(replace(settings, work_dir=root / "tts" / "cpu")),
+    )
+
+
 def _process_events_until(app, predicate, timeout_ms: int = 1500):  # type: ignore[no-untyped-def]
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -2624,7 +2729,13 @@ def test_settings_dialog_allows_import_without_existing_character_registry(monke
         "getOpenFileName",
         lambda *_args, **_kwargs: (str(archive_path), ""),
     )
+    warnings: list[str] = []
     monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: warnings.append(str(_args[2] if len(_args) > 2 else "")),
+    )
 
     assert dialog.character_combo.currentText() == "尚未导入角色"
     assert not dialog.character_combo.isEnabled()
@@ -2633,6 +2744,7 @@ def test_settings_dialog_allows_import_without_existing_character_registry(monke
 
     dialog._import_character_archive()
 
+    assert warnings == []
     assert dialog.character_combo.isEnabled()
     assert dialog.character_combo.currentData() == "nanami"
     assert dialog._selected_character_profile().display_name == "Nanami"
@@ -2702,6 +2814,7 @@ def test_settings_dialog_imports_voice_archive_for_selected_character(monkeypatc
 
 def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2710,6 +2823,7 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
     from app.config.character_loader import CharacterRegistry
     from app.ui.settings_dialog import SettingsDialog
 
+    Qt = qtcore.Qt
     case_root = _ui_runtime_root("char_export_menu")
     root = case_root / "runtime"
     profile = _build_settings_dialog_character(root, "sakura", "Sakura")
@@ -2741,6 +2855,9 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
 
     assert dialog.character_export_button.text() == "导出"
     assert dialog.character_export_button.menu() is dialog.character_export_menu
+    assert bool(dialog.character_export_menu.windowFlags() & Qt.WindowType.FramelessWindowHint)
+    assert bool(dialog.character_export_menu.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
+    assert dialog.character_export_menu.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert [action.text() for action in dialog.character_export_menu.actions()] == [
         "导出完整包 (.char)",
         "导出单角色包 (.char)",
@@ -3557,6 +3674,9 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
         def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
             pass
 
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
         def save_system_values(self, *_args):  # type: ignore[no-untyped-def]
             pass
 
@@ -3626,6 +3746,9 @@ def test_show_settings_applies_launch_at_login_change(monkeypatch) -> None:  # t
             pass
 
         def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
             pass
 
         def save_startup_settings(self, settings):  # type: ignore[no-untyped-def]
@@ -3759,6 +3882,9 @@ def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> 
             pass
 
         def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
             pass
 
         def save_system_values(self, section, values):  # type: ignore[no-untyped-def]
@@ -4112,6 +4238,9 @@ def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch
         def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
             pass
 
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
         def save_system_values(self, *_args):  # type: ignore[no-untyped-def]
             pass
 
@@ -4205,6 +4334,9 @@ def test_show_settings_uses_dialog_refreshed_character_registry(monkeypatch) -> 
             pass
 
         def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
             pass
 
         def save_system_values(self, *_args):  # type: ignore[no-untyped-def]
@@ -6041,6 +6173,7 @@ def test_pet_window_syncs_macos_native_topmost_state(monkeypatch) -> None:  # ty
 
     class MinimalWindow:
         _sync_native_topmost_state = PetWindow._sync_native_topmost_state
+        _topmost_sync_windows = PetWindow._topmost_sync_windows
 
         always_on_top_enabled = True
 
@@ -6598,6 +6731,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         _retire_tts_provider = pet_window_cls._retire_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings
+        _apply_bubble_settings = pet_window_cls._apply_bubble_settings
 
         def _create_tts_provider_from_settings(self, _settings):  # type: ignore[no-untyped-def]
             return object()
@@ -6840,3 +6974,144 @@ def test_send_message_injects_runtime_event_context_before_user_message() -> Non
     assert history == [("user", "继续刚才的话题")]
     # 队列已被一次性消费
     assert len(window.runtime_event_queue) == 0
+
+
+def _qt_app_or_skip():  # type: ignore[no-untyped-def]
+    """统一获取/创建 QApplication；stub 环境下跳过。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+    return qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
+
+
+def test_pet_input_stylesheet_reduces_white_overlay() -> None:
+    stylesheet = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
+    normal_start = stylesheet.index("#petInput {")
+    focus_start = stylesheet.index("#petInput:focus")
+    normal_block = stylesheet[normal_start:focus_start]
+    focus_block = stylesheet[focus_start:focus_start + 200]
+    # 普通态/聚焦态白底 alpha 应明显低于原始厚白（96/132），靠背后强模糊提供玻璃质感。
+    assert ", 55)" in normal_block
+    assert ", 90)" in focus_block
+
+
+def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtCore import QPoint, QRect
+    from PySide6.QtWidgets import QWidget
+    from app.ui.pet_window import PetWindow
+
+    host = QWidget()
+    host.move(100, 200)
+    rect = QRect(10, 20, 300, 128)
+
+    # 子窗口定位：本地矩形按主窗口原点转换为全局坐标，尺寸不变。
+    result = PetWindow._local_rect_to_global(host, rect)  # type: ignore[arg-type]
+
+    assert result.size() == rect.size()
+    assert result.topLeft() == host.mapToGlobal(QPoint(10, 20))
+    host.deleteLater()
+
+
+def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QWidget
+    from app.ui.input_bar_animator import InputBarAnimator
+
+    bar = QWidget()
+    window = QWidget()
+    pinned = {"value": False}
+    hover = {"value": False}
+    animator = InputBarAnimator(
+        bar,
+        window,
+        lambda: pinned["value"],
+        lambda: hover["value"],
+    )
+
+    animator._hover = False
+    assert animator._target_visible() is False
+
+    animator._hover = True
+    assert animator._target_visible() is True
+
+    # 鼠标移开但 pinned（有文本/待确认动作）时仍保持可见，不被收起。
+    animator._hover = False
+    pinned["value"] = True
+    assert animator._target_visible() is True
+
+    bar.deleteLater()
+    window.deleteLater()
+
+
+def test_input_bar_animator_send_feedback_starts_animation() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QWidget
+    from app.ui.input_bar_animator import InputBarAnimator
+
+    bar = QWidget()
+    window = QWidget()
+    animator = InputBarAnimator(bar, window, lambda: False, lambda: False)
+
+    animator.play_send_feedback()
+    assert animator._send_anim is not None
+
+    bar.deleteLater()
+    window.deleteLater()
+
+
+class _StubVoicePlayback:
+    def discard_prepared(self) -> None:
+        pass
+
+    def speak_segment(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+    def prepare_next(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+
+def _build_subtitle_controller(effect):  # type: ignore[no-untyped-def]
+    from PySide6.QtWidgets import QLabel
+    from app.ui.subtitle_controller import SubtitleController
+
+    return SubtitleController(
+        QLabel(),
+        _StubVoicePlayback(),
+        "zh",
+        lambda *args: None,
+        lambda *args: None,
+        lambda: None,
+        lambda: False,
+        bubble_opacity_effect=effect,
+    )
+
+
+def test_subtitle_cancel_without_transition_keeps_bubble_opaque() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+    effect = QGraphicsOpacityEffect()
+    effect.setOpacity(1.0)
+    controller = _build_subtitle_controller(effect)
+
+    # 发送占位等高频路径 transition=False，不应触发气泡脉冲。
+    controller.cancel_reply_flow("......", transition=False)
+
+    assert controller._bubble_fade_anim is None
+    assert effect.opacity() == 1.0
+
+
+def test_subtitle_segment_pulse_creates_bubble_animation() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+    effect = QGraphicsOpacityEffect()
+    effect.setOpacity(1.0)
+    controller = _build_subtitle_controller(effect)
+
+    # 分段台词开始（pulse=True）应创建一次气泡浮现脉冲动画。
+    controller.set_speech("一段台词", pulse=True)
+
+    assert controller._bubble_fade_anim is not None

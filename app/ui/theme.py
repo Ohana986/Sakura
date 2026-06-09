@@ -32,6 +32,8 @@ THEME_COLOR_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("bubble_background_color", "气泡背景色", DEFAULT_BUBBLE_BACKGROUND_COLOR),
     ("border_color", "边框色", DEFAULT_BORDER_COLOR),
 )
+SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME = "settingsComboPopupContainer"
+SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME = "settingsComboPopupView"
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -174,9 +176,9 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     theme = settings.normalized()
     return f"""
 #speechBubble {{
-    background: {rgba(theme.bubble_background_color, 220)};
-    border: 1px solid {rgba(theme.border_color, 158)};
-    border-radius: 26px;
+    background: {rgba(theme.bubble_background_color, 238)};
+    border: 1px solid {rgba(theme.border_color, 170)};
+    border-radius: 20px;
 }}
 #speakerName {{
     color: {theme.primary_color};
@@ -221,7 +223,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     border: none;
 }}
 #petInput {{
-    background: {rgba(theme.input_background_color, 96)};
+    background: {rgba(theme.input_background_color, 55)};
     border: 1px solid rgba(255, 255, 255, 218);
     border-radius: 19px;
     color: {mix(theme.text_color, "#000000", 0.08)};
@@ -231,7 +233,7 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
     selection-background-color: {rgba(theme.primary_color, 92)};
 }}
 #petInput:focus {{
-    background: {rgba(theme.input_background_color, 132)};
+    background: {rgba(theme.input_background_color, 90)};
     border: 1px solid {rgba(theme.primary_color, 210)};
 }}
 #petInput:disabled {{
@@ -248,8 +250,8 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
 }}
 #sendButton {{
     border-radius: 16px;
-    min-width: 68px;
-    padding: 4px 14px;
+    min-width: 50px;
+    padding: 4px 10px;
 }}
 #screenshotButton {{
     width: 36px;
@@ -297,15 +299,15 @@ def build_pet_window_stylesheet(settings: ThemeSettings) -> str:
 QMenu {{
     background: {rgba(theme.input_background_color, 246)};
     border: 1px solid {rgba(theme.border_color, 164)};
-    border-radius: 8px;
+    border-radius: 14px;
     color: {theme.text_color};
     font-size: 14px;
-    padding: 4px;
+    padding: 6px;
 }}
 QMenu::item {{
     background: transparent;
-    border-radius: 6px;
-    padding: 4px 20px 4px 24px;
+    border-radius: 8px;
+    padding: 5px 20px 5px 24px;
 }}
 QMenu::item:selected {{
     background: {rgba(theme.panel_background_color, 220)};
@@ -430,9 +432,24 @@ QComboBox::down-arrow {{
     width: 12px;
     height: 12px;
 }}
-QComboBox QAbstractItemView {{
+QComboBoxPrivateContainer {{
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+}}
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} {{
     background: {rgba(theme.input_background_color, 246)};
-    border: 1px solid {rgba(theme.border_color, 158)};
+    border: none;
+    border-radius: 7px;
+    padding: 2px;
+}}
+QComboBox QAbstractItemView,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
     border-radius: 7px;
     color: {theme.text_color};
     font-size: 14px;
@@ -441,17 +458,43 @@ QComboBox QAbstractItemView {{
     selection-background-color: {rgba(theme.panel_background_color, 220)};
     selection-color: {theme.text_color};
 }}
-QComboBox QAbstractItemView::item {{
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
+    background: transparent;
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
+    background: {rgba(theme.input_background_color, 246)};
+}}
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
+    background: transparent;
+}}
+QComboBox QAbstractItemView::item,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item {{
     min-height: 22px;
     padding: 3px 8px;
     border-radius: 5px;
 }}
-QComboBox QAbstractItemView::item:hover {{
+QComboBox QAbstractItemView::item:hover,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover {{
     background: {rgba(theme.panel_background_color, 185)};
 }}
 QComboBox QAbstractItemView::item:selected,
 QComboBox QAbstractItemView::item:selected:active,
-QComboBox QAbstractItemView::item:selected:!active {{
+QComboBox QAbstractItemView::item:selected:!active,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active {{
     background: {rgba(theme.primary_color, 43)};
     color: {theme.text_color};
 }}
@@ -539,6 +582,147 @@ QPushButton:disabled {{
     background: {rgba(theme.primary_color, 107)};
     border: 1px solid {rgba(theme.border_color, 115)};
     color: rgba(255, 255, 255, 0.76);
+}}
+"""
+
+
+def build_app_chrome_stylesheet(settings: ThemeSettings) -> str:
+    """全局应用级样式：美化下拉弹窗(QComboBox 弹出列表)与滚动条。
+
+    这些控件的弹出/绘制是独立顶层，对话框级 setStyleSheet 传播不到；且 main.py 用 Fusion 风格
+    后系统原生外观失效。所以必须在 QApplication 级统一设置，才能让它们跟随主题。
+    """
+    theme = settings.normalized()
+    return f"""
+QScrollBar:vertical {{
+    background: transparent;
+    width: 12px;
+    margin: 2px 2px 2px 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {rgba(theme.primary_color, 120)};
+    border-radius: 5px;
+    min-height: 28px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {rgba(theme.primary_color, 185)};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
+    background: transparent;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: transparent;
+}}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 12px;
+    margin: 0 2px 2px 2px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {rgba(theme.primary_color, 120)};
+    border-radius: 5px;
+    min-width: 28px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {rgba(theme.primary_color, 185)};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0;
+    background: transparent;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: transparent;
+}}
+QMenu {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
+    border-radius: 8px;
+    color: {theme.text_color};
+    font-size: 14px;
+    padding: 6px;
+}}
+QMenu::item {{
+    background: transparent;
+    border-radius: 6px;
+    padding: 5px 20px 5px 20px;
+}}
+QMenu::item:selected {{
+    background: {rgba(theme.panel_background_color, 220)};
+    color: {theme.text_color};
+}}
+QMenu::item:disabled {{
+    color: {rgba(theme.muted_text_color, 145)};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {rgba(theme.border_color, 105)};
+    margin: 3px 7px;
+}}
+QComboBoxPrivateContainer {{
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+}}
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
+    border-radius: 7px;
+    padding: 2px;
+}}
+QComboBox QAbstractItemView,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
+    border-radius: 7px;
+    color: {theme.text_color};
+    outline: 0;
+    padding: 2px;
+    selection-background-color: {rgba(theme.panel_background_color, 220)};
+    selection-color: {theme.text_color};
+}}
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
+    background: transparent;
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
+    background: {rgba(theme.input_background_color, 246)};
+}}
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
+    background: transparent;
+}}
+QComboBox QAbstractItemView::item,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item {{
+    min-height: 22px;
+    padding: 3px 8px;
+    border-radius: 5px;
+}}
+QComboBox QAbstractItemView::item:hover,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover {{
+    background: {rgba(theme.panel_background_color, 185)};
+}}
+QComboBox QAbstractItemView::item:selected,
+QComboBox QAbstractItemView::item:selected:active,
+QComboBox QAbstractItemView::item:selected:!active,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active {{
+    background: {rgba(theme.primary_color, 70)};
+    color: {theme.text_color};
 }}
 """
 
