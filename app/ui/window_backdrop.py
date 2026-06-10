@@ -65,6 +65,10 @@ class MacOSVisualEffectBackdrop:
 
     通过 ctypes 调用 Objective-C runtime 创建 NSVisualEffectView 并添加到窗口内容视图。
     material 使用 Popover（弹出窗口风格），blendingMode 使用 BehindWindow（模糊窗口后方内容）。
+
+    注意：arm64 macOS 上 NSRect 是 HFA-4（4×double），ctypes 不支持 HFA 调用约定，
+    传 NSRect struct 给 objc_msgSend 会被错误地当作指针传递。
+    因此这里使用 init（无参）+ NSLayoutConstraint 固定四边来避免任何 NSRect 传参。
     任何调用失败都静默降级到 FallbackTintBackdrop。
     """
 
@@ -78,6 +82,9 @@ class MacOSVisualEffectBackdrop:
 
     def apply(self, window: QWidget, tint: QColor) -> None:
         if sys.platform != "darwin":
+            return
+        # 幂等：已创建过就不再重复添加
+        if self._effect_view is not None:
             return
         try:
             import ctypes
@@ -124,28 +131,18 @@ class MacOSVisualEffectBackdrop:
                 self._fallback.apply(window, tint)
                 return
 
-            # alloc + initWithFrame:
+            # alloc + init（不用 initWithFrame:，因为 NSRect 在 arm64 上是 HFA-4，
+            # ctypes 无法正确按值传递 HFA struct 给 objc_msgSend）
             alloc = msg_send(ns_visual_effect_class, "alloc")
-            # 使用窗口的 bounds 作为 frame
-            bounds = msg_send(ctypes.c_void_p(content_view), "bounds")
-            # bounds 是 NSRect (struct)，需要特殊处理
-            # 简化：使用 initWithFrame:NSZeroRect，然后 setAutoresizingMask
-            zero_rect = (ctypes.c_double * 4)(0, 0, 0, 0)
-            objc.objc_msgSend.restype = ctypes.c_void_p
-            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-            effect_view = objc.objc_msgSend(
-                alloc,
-                objc.sel_registerName(b"initWithFrame:"),
-                zero_rect,
-            )
+            effect_view = msg_send(alloc, "init")
             if not effect_view:
                 self._fallback.apply(window, tint)
                 return
 
             self._effect_view = ctypes.c_void_p(effect_view)
 
-            # setAutoresizingMask: NSViewWidthSizable | NSViewHeightSizable
-            msg_send(self._effect_view, "setAutoresizingMask:", ctypes.c_ulong(2 | 16))
+            # 关闭 autoresizing mask，改用 NSLayoutConstraint 固定四边
+            msg_send(self._effect_view, "setTranslatesAutoresizingMaskIntoConstraints:", ctypes.c_bool(False))
 
             # setMaterial: NSVisualEffectMaterialPopover
             msg_send(
@@ -171,7 +168,44 @@ class MacOSVisualEffectBackdrop:
             # addSubview: 添加到 contentView
             msg_send(ctypes.c_void_p(content_view), "addSubview:", self._effect_view)
 
-            # 确保 effect view 在最底层（其他内容在上）
+            # ── NSLayoutConstraint 固定四边 ──
+            # 所有参数都是 c_void_p / c_long，无 NSRect/NSSize/NSPoint struct 传参。
+            constraint_class = objc.objc_getClass(b"NSLayoutConstraint")
+            if constraint_class:
+                ev = self._effect_view
+                cv = ctypes.c_void_p(content_view)
+                c_long = ctypes.c_long
+
+                # 创建四条 edge 约束: effectView.edge = contentView.edge
+                constraints = []
+                for attr in (1, 2, 3, 4):  # Leading, Trailing, Top, Bottom
+                    c = msg_send(
+                        constraint_class,
+                        "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
+                        ev, c_long(attr), c_long(0), cv, c_long(attr), ctypes.c_double(1.0), ctypes.c_double(0.0),
+                    )
+                    if c:
+                        constraints.append(c)
+
+                if constraints:
+                    # NSArray arrayWithObjects:count: — 纯标量参数，arm64 安全
+                    n = len(constraints)
+                    ArrT = ctypes.c_void_p * n
+                    arr = ArrT(*constraints)
+                    arr_ptr = ctypes.cast(arr, ctypes.c_void_p)
+                    ns_array = msg_send(
+                        objc.objc_getClass(b"NSArray"),
+                        "arrayWithObjects:count:",
+                        arr_ptr, ctypes.c_ulong(n),
+                    )
+                    if ns_array:
+                        msg_send(
+                            constraint_class,
+                            "activateConstraints:",
+                            ctypes.c_void_p(ns_array),
+                        )
+
+            # 确保 effect view 启用 layer
             msg_send(self._effect_view, "setWantsLayer:", ctypes.c_bool(True))
 
         except Exception as exc:  # noqa: BLE001

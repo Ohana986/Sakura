@@ -721,6 +721,9 @@ class PetWindow(QWidget):
     def moveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().moveEvent(event)
         self._reposition_child_windows()
+        # macOS 上拖动导致 Qt.Tool 子窗口层级丢失，需要重新 raise
+        if sys.platform == "darwin":
+            self._raise_foreground_controls()
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
@@ -916,6 +919,9 @@ class PetWindow(QWidget):
     def _finish_drag_resume(self) -> None:
         """拖动松手后：把卡片窗口摆到新位置，再让输入栏按可见性重算（重截新位置桌面后现身）。"""
         self._reposition_child_windows()
+        # macOS 上拖动结束后子窗口层级可能丢失，重新 raise
+        if sys.platform == "darwin":
+            self._raise_foreground_controls()
         animator = getattr(self, "input_bar_animator", None)
         if animator is not None:
             animator.resume_after_drag()
