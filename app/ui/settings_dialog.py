@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QPainterPath, QRegion
+from PySide6.QtCore import QObject, QSize, QStringListModel, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor, QPainterPath, QPalette, QRegion
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -144,6 +144,7 @@ from app.ui.theme import (
     normalize_hex_color,
     mix,
     parse_ai_theme_response,
+    rgba,
 )
 from app.ui.window_backdrop import VisualEffectMode
 from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
@@ -152,6 +153,8 @@ from sdk.types import SettingsPanelContribution, ToolsTabContribution
 
 MEMORY_READING_TEXT = "正在读取长期记忆..."
 MEMORY_DEPENDENCY_LOADING_TEXT = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
+SETTINGS_COMBO_POPUP_ITEM_HEIGHT = 28
+SETTINGS_COMBO_POPUP_PADDING = 0
 
 
 def _prepare_combo_popup_view(combo: QComboBox) -> None:
@@ -171,6 +174,88 @@ def _prepare_popup_menu(menu: QMenu) -> None:
         | Qt.WindowType.NoDropShadowWindowHint
     )
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+
+def _apply_combo_popup_palette(widget: QWidget, settings: ThemeSettings) -> None:
+    """给自绘下拉/补全弹层显式同步调色板，避免沿用旧的全局主题色。"""
+    theme = settings.normalized()
+    background = QColor(theme.input_background_color)
+    text = QColor(theme.text_color)
+    selected = QColor(theme.primary_color)
+    palette = widget.palette()
+    for role in (
+        QPalette.ColorRole.Window,
+        QPalette.ColorRole.Base,
+        QPalette.ColorRole.AlternateBase,
+    ):
+        palette.setColor(role, background)
+    palette.setColor(QPalette.ColorRole.Text, text)
+    palette.setColor(QPalette.ColorRole.WindowText, text)
+    palette.setColor(QPalette.ColorRole.Highlight, selected)
+    palette.setColor(QPalette.ColorRole.HighlightedText, text)
+    widget.setPalette(palette)
+    widget.setAutoFillBackground(True)
+    widget.setStyleSheet(_combo_popup_stylesheet(theme))
+    viewport = getattr(widget, "viewport", lambda: None)()
+    if isinstance(viewport, QWidget):
+        viewport.setPalette(palette)
+        viewport.setAutoFillBackground(True)
+
+
+def _combo_popup_stylesheet(settings: ThemeSettings) -> str:
+    theme = settings.normalized()
+    return f"""
+QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
+    border-radius: 7px;
+    padding: 0;
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
+    background: {rgba(theme.input_background_color, 246)};
+    border: none;
+    border-radius: 7px;
+    color: {theme.text_color};
+    outline: 0;
+    padding: 0;
+    selection-background-color: {rgba(theme.primary_color, 72)};
+    selection-color: {theme.text_color};
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
+    background: {rgba(theme.input_background_color, 246)};
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item {{
+    min-height: 22px;
+    padding: 3px 8px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover {{
+    background: {rgba(theme.primary_color, 34)};
+    border: 1px solid {rgba(theme.primary_color, 58)};
+}}
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
+QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active {{
+    background: {rgba(theme.primary_color, 72)};
+    border: 1px solid {rgba(theme.primary_color, 118)};
+    color: {theme.text_color};
+}}
+"""
 
 
 class ApiConnectionTestWorker(QObject):
@@ -223,24 +308,35 @@ class SettingsComboBox(QComboBox):
         _prepare_combo_popup_view(self)
         self._popup_frame: QFrame | None = None
         self._popup_list: QListWidget | None = None
+        self._popup_theme = DEFAULT_THEME_SETTINGS
+
+    def set_popup_theme(self, settings: ThemeSettings) -> None:
+        self._popup_theme = settings.normalized()
+        if self._popup_frame is not None:
+            _apply_combo_popup_palette(self._popup_frame, self._popup_theme)
+        if self._popup_list is not None:
+            _apply_combo_popup_palette(self._popup_list, self._popup_theme)
 
     def showPopup(self) -> None:  # noqa: N802 - Qt 虚函数命名。
         if not self.isEnabled() or self.count() <= 0:
             return
         popup, popup_list = self._ensure_popup()
+        self.set_popup_theme(self._popup_theme)
         popup_list.clear()
         for index in range(self.count()):
             item = QListWidgetItem(self.itemText(index))
             item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setSizeHint(QSize(0, SETTINGS_COMBO_POPUP_ITEM_HEIGHT))
             popup_list.addItem(item)
         if self.currentIndex() >= 0:
             popup_list.setCurrentRow(self.currentIndex())
 
-        row_height = popup_list.sizeHintForRow(0)
-        if row_height <= 0:
-            row_height = 28
         visible_rows = min(max(self.count(), 1), 10)
-        popup_height = row_height * visible_rows + 4
+        popup_height = (
+            SETTINGS_COMBO_POPUP_ITEM_HEIGHT * visible_rows
+            + SETTINGS_COMBO_POPUP_PADDING
+        )
+        popup_list.setFixedHeight(popup_height)
         bottom_left = self.mapToGlobal(self.rect().bottomLeft())
         popup.setGeometry(bottom_left.x(), bottom_left.y(), self.width(), popup_height)
         path = QPainterPath()
@@ -274,6 +370,8 @@ class SettingsComboBox(QComboBox):
             popup_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             popup_list.itemClicked.connect(self._select_popup_item)
             popup_list.itemActivated.connect(self._select_popup_item)
+            _apply_combo_popup_palette(popup, self._popup_theme)
+            _apply_combo_popup_palette(popup_list, self._popup_theme)
 
             layout = QVBoxLayout()
             layout.setContentsMargins(0, 0, 0, 0)
@@ -307,9 +405,15 @@ class ModelComboBox(SettingsComboBox):
         completer.setPopup(completion_popup)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._completion_popup = completion_popup
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.setCompleter(completer)
+        self.set_popup_theme(DEFAULT_THEME_SETTINGS)
+
+    def set_popup_theme(self, settings: ThemeSettings) -> None:
+        super().set_popup_theme(settings)
+        _apply_combo_popup_palette(self._completion_popup, self._popup_theme)
 
     def setText(self, text: str) -> None:
         self.setEditText(text)
@@ -816,7 +920,7 @@ class SettingsDialog(QDialog):
         self.theme_text_edit = self.theme_color_edits["text_color"]
         self.theme_text_button = self.theme_color_buttons["text_color"]
         # 外观效果模式下拉框
-        self.theme_visual_effect_combo = QComboBox(tab)
+        self.theme_visual_effect_combo = SettingsComboBox(tab)
         for mode_id in VisualEffectMode.available_modes():
             label = {
                 VisualEffectMode.SOLID: "纯色块",
@@ -2036,6 +2140,8 @@ class SettingsDialog(QDialog):
         self.theme_settings = theme
         self.setStyleSheet(build_settings_dialog_stylesheet(theme))
         self._apply_app_chrome_stylesheet()
+        for combo in self.findChildren(SettingsComboBox):
+            combo.set_popup_theme(theme)
         inline_styles = {
             "theme_status_label": f"color: {theme.muted_text_color};",
             "memory_status_label": f"color: {theme.muted_text_color};",
