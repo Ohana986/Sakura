@@ -790,7 +790,6 @@ class SettingsDialog(QDialog):
             label = {
                 VisualEffectMode.SOLID: "纯色块",
                 VisualEffectMode.GAUSSIAN_BLUR: "高斯模糊",
-                VisualEffectMode.WINDOWS_ACRYLIC: "Windows 亚克力模糊",
                 VisualEffectMode.MACOS_VISUAL_EFFECT: "macOS 原生毛玻璃",
             }.get(mode_id, mode_id)
             self.theme_visual_effect_combo.addItem(label, mode_id)

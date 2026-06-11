@@ -1003,7 +1003,9 @@ def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None: 
             self.layout_count = 0
             self.topmost_sync_count = 0
 
-        def _layout_stage(self) -> None:
+        def _apply_pet_layout(self, *, anchor_global=None) -> None:  # type: ignore[no-untyped-def]
+            # 换屏恢复走统一布局；最小窗口无立绘，这里直接按 stage_size 复位并计数。
+            self.resize(*self.stage_size)
             self.layout_count += 1
 
         def _schedule_native_topmost_sync(self) -> None:
@@ -1180,6 +1182,91 @@ def test_portrait_controller_scales_pixmap_by_configured_percent() -> None:
     app.processEvents()
 
 
+def test_portrait_controller_never_resizes_parent_window() -> None:
+    """方案2 契约：PortraitController 只贴立绘 + relayout，绝不 resize 主窗口。
+
+    主窗口几何统一由 PetWindow 以底边为锚点管理；若控制器再做左上锚点 resize，
+    会与底边锚点几何相互打架，产生切表情/缩放时的偶发跳闪。此处把宿主尺寸设成与
+    stage_size 不同的哨兵值，验证 apply_current 后宿主尺寸保持不变，且 relayout 仍被调用。
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    qtgui = pytest.importorskip("PySide6.QtGui")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not all(
+        hasattr(qtwidgets, name)
+        for name in ("QApplication", "QGraphicsOpacityEffect", "QLabel", "QWidget")
+    ):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.config.character_loader import CharacterProfile
+    from app.ui.portrait_controller import PortraitController
+
+    QApplication = qtwidgets.QApplication
+    QGraphicsOpacityEffect = qtwidgets.QGraphicsOpacityEffect
+    QLabel = qtwidgets.QLabel
+    QWidget = qtwidgets.QWidget
+    QPixmap = qtgui.QPixmap
+    Qt = qtcore.Qt
+    app = QApplication.instance() or QApplication([])
+
+    tmp_path = (
+        Path(__file__).resolve().parents[2]
+        / "temp"
+        / "test_runtime"
+        / "portrait_no_resize"
+        / uuid.uuid4().hex
+    )
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    portrait_path = tmp_path / "portrait.png"
+    source = QPixmap(1000, 1000)
+    source.fill(Qt.GlobalColor.white)
+    assert source.save(str(portrait_path))
+
+    profile = CharacterProfile(
+        id="demo",
+        display_name="Demo",
+        package_dir=tmp_path,
+        card_path=tmp_path / "card.md",
+        initial_message="hello",
+        default_portrait_path=portrait_path,
+    )
+    host = QWidget()
+    main_label = QLabel(host)
+    transition_label = QLabel(host)
+    relayout_calls = {"count": 0}
+
+    def _relayout() -> None:
+        relayout_calls["count"] += 1
+
+    controller = PortraitController(
+        profile=profile,
+        parent_widget=host,
+        main_label=main_label,
+        transition_label=transition_label,
+        main_opacity_effect=QGraphicsOpacityEffect(main_label),
+        transition_opacity_effect=QGraphicsOpacityEffect(transition_label),
+        # stage_size 故意区别于下面的哨兵尺寸，若控制器误 resize 会被立即发现。
+        stage_size=(860, 640),
+        relayout=_relayout,
+        raise_foreground=lambda: None,
+        on_portrait_changed=lambda _pixmap: None,
+    )
+
+    sentinel_size = qtcore.QSize(321, 234)
+    host.resize(sentinel_size)
+    assert host.size() == sentinel_size
+
+    controller.apply_current()
+
+    # 关键断言：宿主尺寸未被改成 stage_size，仍是哨兵尺寸；relayout 仍被调用。
+    assert host.size() == sentinel_size
+    assert relayout_calls["count"] >= 1
+
+    host.deleteLater()
+    app.processEvents()
+
+
 def test_pet_window_loads_normalized_portrait_scale_percent() -> None:
     from app.ui.pet_window import PetWindow
 
@@ -1197,32 +1284,6 @@ def test_pet_window_loads_normalized_portrait_scale_percent() -> None:
     assert MinimalWindow({"portrait_scale_percent": "invalid"})._load_portrait_scale_percent() == 100
     assert MinimalWindow({"portrait_scale_percent": 20})._load_portrait_scale_percent() == 50
     assert MinimalWindow({"portrait_scale_percent": 180})._load_portrait_scale_percent() == 150
-
-
-def test_stage_size_shrinks_with_portrait_scale_below_default_height() -> None:
-    from app.ui.pet_window import _stage_size_for_portrait_scale_percent, MIN_STAGE_HEIGHT
-
-    # scale=100 → 默认 640px，不受影响
-    width, height = _stage_size_for_portrait_scale_percent(100)
-    assert width == 860
-    assert height == 640
-
-    # scale=65 → 640*0.65 = 416，触及下限 420
-    _, height = _stage_size_for_portrait_scale_percent(65)
-    assert height == MIN_STAGE_HEIGHT
-
-    # scale=50 → 640*0.5 = 320，下限保护
-    _, height = _stage_size_for_portrait_scale_percent(50)
-    assert height == MIN_STAGE_HEIGHT
-
-    # scale=150 → 640*1.5 = 960，正常放大
-    _, height = _stage_size_for_portrait_scale_percent(150)
-    assert height == 960
-
-    # 宽度始终固定 860，不随缩放变化
-    for percent in (50, 65, 100, 150):
-        width, _ = _stage_size_for_portrait_scale_percent(percent)
-        assert width == 860
 
 
 def test_control_panel_layout_normalization() -> None:
@@ -1261,37 +1322,6 @@ def test_control_panel_layout_normalization() -> None:
     assert normalize_control_panel_vertical_offset(40) == 40
     assert normalize_control_panel_vertical_offset(-40) == -40
     assert normalize_control_panel_vertical_offset(0) == 0
-
-
-def test_stage_size_for_layout_respects_panel_and_bubble() -> None:
-    from app.ui.pet_window import DEFAULT_STAGE_WIDTH, _stage_size_for_layout
-    from app.ui.control_panel_layout import (
-        DEFAULT_BUBBLE_HEIGHT,
-        DEFAULT_CONTROL_PANEL_WIDTH,
-        MAX_CONTROL_PANEL_WIDTH,
-        MIN_CONTROL_PANEL_WIDTH,
-    )
-
-    # 默认参数：宽度保底为默认舞台宽度 860，高度 640
-    width, height = _stage_size_for_layout(
-        100, DEFAULT_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT
-    )
-    assert width == DEFAULT_STAGE_WIDTH
-    assert height == 640
-
-    # 控制组加宽到上限：舞台宽度扩展为 panel + 96
-    wide_width, _ = _stage_size_for_layout(100, MAX_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT)
-    assert wide_width == MAX_CONTROL_PANEL_WIDTH + 96
-
-    # 控制组窄于默认时仍保底 860
-    narrow_width, _ = _stage_size_for_layout(100, MIN_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT)
-    assert narrow_width == DEFAULT_STAGE_WIDTH
-
-    # 气泡变高：舞台高度随气泡增量同步增高
-    _, taller = _stage_size_for_layout(
-        100, DEFAULT_CONTROL_PANEL_WIDTH, DEFAULT_BUBBLE_HEIGHT + 60
-    )
-    assert taller == 640 + 60
 
 
 def test_pet_window_defaults_subtitle_language_to_chinese() -> None:
@@ -5400,6 +5430,52 @@ def test_settings_dialog_returns_theme_settings() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_downgrades_saved_windows_acrylic_to_gaussian(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import window_backdrop as window_backdrop_module
+    from app.ui.settings_dialog import SettingsDialog
+    from app.ui.window_backdrop import VisualEffectMode
+
+    monkeypatch.setattr(window_backdrop_module.sys, "platform", "win32")
+    monkeypatch.setattr(window_backdrop_module, "_windows_build", lambda: 22631)
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("theme_settings_windows_acrylic_downgrade")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(visual_effect_mode=VisualEffectMode.WINDOWS_ACRYLIC),
+    )
+
+    labels = [
+        dialog.theme_visual_effect_combo.itemText(index)
+        for index in range(dialog.theme_visual_effect_combo.count())
+    ]
+    assert "Windows 亚克力模糊" not in labels
+    assert dialog.theme_visual_effect_combo.currentData() == VisualEffectMode.GAUSSIAN_BLUR
+
+    dialog.accept()
+
+    assert dialog.result_theme_settings is not None
+    assert dialog.result_theme_settings.visual_effect_mode == VisualEffectMode.GAUSSIAN_BLUR
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_character_selection_loads_character_theme() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -6938,6 +7014,7 @@ def _build_minimal_manual_screenshot_window(text: str):
         "pending_manual_screen_observation",
         None,
     )
+    window._collapse_auto_fit_bubble_height = lambda: None
     return window, requests, history
 
 
@@ -7329,22 +7406,22 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         def _create_tts_provider_from_settings(self, _settings):  # type: ignore[no-untyped-def]
             return object()
 
-        def _apply_portrait_scale_percent(self, percent: int) -> None:
-            self.portrait_scale_percent = percent
-
-        def _apply_control_panel_layout(  # type: ignore[no-untyped-def]
+        def _apply_layout_settings(  # type: ignore[no-untyped-def]
             self,
+            *,
+            portrait_scale_percent,
             control_panel_width,
             bubble_height,
             vertical_offset,
             input_bar_offset,
-            *,
-            persist: bool = True,
+            persist: bool,
         ) -> None:
+            self.portrait_scale_percent = portrait_scale_percent
             self.control_panel_width = control_panel_width
             self.bubble_height = bubble_height
             self.control_panel_vertical_offset = vertical_offset
             self.input_bar_offset = input_bar_offset
+            self.layout_persisted = persist
 
         def _sync_proactive_care_timer(self) -> None:
             pass
@@ -7634,54 +7711,173 @@ def test_pet_window_applies_visual_effect_dynamic_property() -> None:
     window.input_bar.deleteLater()
 
 
-def test_pet_window_removes_old_backdrop_before_hiding_visible_input_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_sync_input_bar_backdrop_toggles_software_blur_layer_by_mode() -> None:
+    """单窗口重构后：纯色模式不挂软件模糊背景层，高斯模式挂载并绑定截图回调。"""
+    from app.ui.pet_window import PetWindow
+    from app.ui.theme import ThemeSettings
+    from app.ui.window_backdrop import VisualEffectMode
+
+    class CardStub:
+        def __init__(self) -> None:
+            self.layer = "untouched"
+
+        def set_background_layer(self, layer) -> None:  # type: ignore[no-untyped-def]
+            self.layer = layer
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self.before_show = "untouched"
+
+        def set_before_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_show = callback
+
+    blur_bg = object()
+
+    def _make_window(mode: str):  # type: ignore[no-untyped-def]
+        window = PetWindow.__new__(PetWindow)
+        window.theme_settings = ThemeSettings(visual_effect_mode=mode)
+        window.input_card = CardStub()
+        window.input_blur_background = blur_bg
+        window.input_bar = None
+        window.input_edit = None
+        window.input_bar_animator = AnimatorStub()
+        return window
+
+    # 纯色：不挂背景层、无截图回调。
+    solid = _make_window(VisualEffectMode.SOLID)
+    PetWindow._sync_input_bar_backdrop(solid)
+    assert solid.input_card.layer is None
+    assert solid.input_bar_animator.before_show is None
+
+    # 高斯模糊：挂软件模糊背景层 + 截图回调。
+    blur = _make_window(VisualEffectMode.GAUSSIAN_BLUR)
+    PetWindow._sync_input_bar_backdrop(blur)
+    assert blur.input_card.layer is blur_bg
+    assert blur.input_bar_animator.before_show == blur._refresh_input_blur_background
+
+
+def test_input_bar_windows_acrylic_config_degrades_to_software_blur(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """旧 windows_acrylic 配置不再回显原生亚克力，运行时降级为高斯模糊。"""
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
     from app.ui.theme import ThemeSettings
     from app.ui.window_backdrop import VisualEffectMode
 
-    events: list[tuple[str, bool]] = []
+    monkeypatch.setattr(pet_window_module.sys, "platform", "win32")
 
-    class OldBackdrop:
-        def remove(self, window) -> None:  # type: ignore[no-untyped-def]
-            events.append(("remove", window.hidden))
-
-    class InputWindowStub:
+    class CardStub:
         def __init__(self) -> None:
-            self.hidden = False
-            self._backdrop = OldBackdrop()
-            self._background_layer = None
+            self.layer = "untouched"
 
-        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
-            return True
+        def set_background_layer(self, layer) -> None:  # type: ignore[no-untyped-def]
+            self.layer = layer
 
-        def hide(self) -> None:
-            self.hidden = True
-            events.append(("hide", self.hidden))
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self.before_show = "untouched"
+            self.after_show = "untouched"
+            self.before_hide = "untouched"
 
-        def show(self) -> None:
-            events.append(("show", self.hidden))
+        def set_before_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_show = callback
 
-    input_window = InputWindowStub()
+        def set_after_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.after_show = callback
+
+        def set_before_hide(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_hide = callback
+
+    blur_bg = object()
     window = PetWindow.__new__(PetWindow)
-    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.SOLID)
-    window.input_window = input_window
-    window.input_blur_background = None
-    window.input_bar_animator = None
-    monkeypatch.setattr(
-        pet_window_module.QApplication,
-        "processEvents",
-        lambda *args, **_kwargs: events.append(("process", input_window.hidden)),
-    )
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.WINDOWS_ACRYLIC)
+    window.input_card = CardStub()
+    window.input_blur_background = blur_bg
+    window.input_bar = None
+    window.input_edit = None
+    window.input_bar_animator = AnimatorStub()
 
     PetWindow._sync_input_bar_backdrop(window)
 
-    assert events == [
-        ("remove", False),
-        ("hide", True),
-        ("process", True),
-        ("show", True),
-    ]
+    assert PetWindow._input_bar_visual_effect_mode(window) == VisualEffectMode.GAUSSIAN_BLUR
+    assert window.input_card.layer is blur_bg
+    assert window.input_bar_animator.before_show == window._refresh_input_blur_background
+    assert window.input_bar_animator.after_show is None
+    assert window.input_bar_animator.before_hide is None
+
+
+def test_sync_input_bar_backdrop_uses_macos_native_backdrop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """macOS 原生毛玻璃模式不走软件截图模糊，而是挂载 NSVisualEffectView backdrop。"""
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+    from app.ui.theme import ThemeSettings
+    from app.ui.window_backdrop import VisualEffectMode
+
+    monkeypatch.setattr(pet_window_module.sys, "platform", "darwin")
+
+    class CardStub:
+        def __init__(self) -> None:
+            self.layer = "untouched"
+            self.visible = True
+
+        def set_background_layer(self, layer) -> None:  # type: ignore[no-untyped-def]
+            self.layer = layer
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return self.visible
+
+    class BackdropStub:
+        def __init__(self) -> None:
+            self.applied: list[object] = []
+            self.removed: list[object] = []
+
+        def apply(self, window, _tint) -> None:  # type: ignore[no-untyped-def]
+            self.applied.append(window)
+
+        def remove(self, window) -> None:  # type: ignore[no-untyped-def]
+            self.removed.append(window)
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self.before_show = "untouched"
+            self.after_show = "untouched"
+            self.before_hide = "untouched"
+
+        def set_before_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_show = callback
+
+        def set_after_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.after_show = callback
+
+        def set_before_hide(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_hide = callback
+
+    blur_bg = object()
+    backdrop = BackdropStub()
+    window = PetWindow.__new__(PetWindow)
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.MACOS_VISUAL_EFFECT)
+    window.input_card = CardStub()
+    window.input_blur_background = blur_bg
+    window.input_native_backdrop = backdrop
+    window.input_bar = None
+    window.input_edit = None
+    window.input_bar_animator = AnimatorStub()
+
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert window.input_card.layer is None
+    assert window.input_bar_animator.before_show is None
+    assert window.input_bar_animator.after_show == window._apply_input_bar_native_backdrop
+    assert window.input_bar_animator.before_hide == window._remove_input_bar_native_backdrop
+    assert backdrop.applied == [window.input_card]
+
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.GAUSSIAN_BLUR)
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert window.input_card.layer is blur_bg
+    assert window.input_bar_animator.before_show == window._refresh_input_blur_background
+    assert window.input_bar_animator.after_show is None
+    assert window.input_bar_animator.before_hide is None
+    assert backdrop.removed == [window.input_card]
 
 
 def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:
@@ -7704,16 +7900,18 @@ def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:
 
 def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
     _qt_app_or_skip()
-    from PySide6.QtWidgets import QWidget
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
     from app.ui.input_bar_animator import InputBarAnimator
 
     bar = QWidget()
-    window = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
     pinned = {"value": False}
     hover = {"value": False}
     animator = InputBarAnimator(
         bar,
-        window,
+        card,
+        effect,
         lambda: pinned["value"],
         lambda: hover["value"],
     )
@@ -7730,23 +7928,26 @@ def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
     assert animator._target_visible() is True
 
     bar.deleteLater()
-    window.deleteLater()
+    card.deleteLater()
 
 
 def test_input_bar_animator_send_feedback_starts_animation() -> None:
     _qt_app_or_skip()
-    from PySide6.QtWidgets import QWidget
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
     from app.ui.input_bar_animator import InputBarAnimator
 
     bar = QWidget()
-    window = QWidget()
-    animator = InputBarAnimator(bar, window, lambda: False, lambda: False)
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    animator = InputBarAnimator(bar, card, effect, lambda: False, lambda: False)
 
+    # 脉冲复用卡片 effect，仅在卡片可见时触发。
+    animator._shown = True
     animator.play_send_feedback()
     assert animator._send_anim is not None
 
     bar.deleteLater()
-    window.deleteLater()
+    card.deleteLater()
 
 
 class _StubVoicePlayback:
