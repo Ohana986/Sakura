@@ -1021,6 +1021,13 @@ class SettingsDialog(QDialog):
         group.setObjectName("settingsSectionContent")
         group.setCheckable(True)
 
+        # 警告说明：始终可见（折叠态也保留），既填充折叠后的空白，又提醒新手勿误改
+        self.advanced_params_hint = QLabel(
+            "⚠ 如果你不清楚这些参数的作用，请保持默认、不要随意修改。", group
+        )
+        self.advanced_params_hint.setObjectName("advancedParamsHint")
+        self.advanced_params_hint.setWordWrap(True)
+
         # 温度：始终生效，缺省回退到内置默认 0.8
         self.llm_temperature_spin = _NoWheelDoubleSpinBox(group)
         self.llm_temperature_spin.setRange(0.0, 2.0)
@@ -1054,7 +1061,7 @@ class SettingsDialog(QDialog):
         self.llm_max_tokens_enabled_check.toggled.connect(self.llm_max_tokens_spin.setEnabled)
 
         form = QFormLayout()
-        form.setContentsMargins(16, 12, 16, 12)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(12)
         form.addRow("温度", self.llm_temperature_spin)
         form.addRow(self.llm_top_p_enabled_check, self.llm_top_p_spin)
@@ -1063,12 +1070,15 @@ class SettingsDialog(QDialog):
         body = QWidget(group)
         body.setLayout(form)
         group_layout = QVBoxLayout()
-        group_layout.setContentsMargins(0, 0, 0, 0)
+        group_layout.setContentsMargins(16, 10, 16, 12)
+        group_layout.setSpacing(10)
+        group_layout.addWidget(self.advanced_params_hint)
         group_layout.addWidget(body)
         group.setLayout(group_layout)
 
-        # checkable group 充当折叠开关：未勾选时隐藏内容区
+        # checkable group 充当折叠开关：未勾选时仅隐藏参数区，警告说明保持可见
         group.toggled.connect(body.setVisible)
+        group.toggled.connect(lambda _checked: self.advanced_params_hint.setEnabled(True))
         has_custom = (
             settings.temperature is not None
             or settings.top_p is not None
@@ -1077,6 +1087,8 @@ class SettingsDialog(QDialog):
         # 已配置过高级参数则默认展开，便于查看；否则默认折叠
         group.setChecked(has_custom)
         body.setVisible(has_custom)
+        # 折叠（未勾选）时 Qt 会禁用 group 内子控件，这里恢复警告说明的可读性
+        self.advanced_params_hint.setEnabled(True)
         return group
 
     def _build_tts_tab(self, settings: GPTSoVITSTTSSettings) -> QWidget:
@@ -2120,6 +2132,7 @@ class SettingsDialog(QDialog):
             "memory_selection_label": f"color: {theme.secondary_text_color};",
             "memory_preview_label": f"color: {theme.text_color};",
             "system_restart_hint_label": f"color: {theme.muted_text_color};",
+            "advanced_params_hint": f"color: {theme.secondary_text_color};",
         }
         for attr, style in inline_styles.items():
             widget = getattr(self, attr, None)
