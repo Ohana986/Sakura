@@ -162,3 +162,49 @@ fallback 用 `intent: "fallback"` 的普通条目表达(兜底池可多句轮换
 ## 11. 与流式输出的关系
 
 真正降低(而非掩盖)延迟的是流式输出——分段 JSON 协议天然适合收到一个完整 segment 就先播。但流式与工具循环、JSON 修复重试的改造量大得多。接话层是低成本互补方案,二者不互斥;若未来实现流式,接话窗口缩短但机制不变。
+
+## 12. 使用方法
+
+本 PR 提供的是**框架 + 可选示例资源**。框架不会默认启用任何角色接话;角色作者或用户需要把接话 manifest 放进角色包,再在角色卡配置里显式引用。
+
+### 安装 Sakura 示例资源
+
+随本文档提供的 Sakura 示例资源位于:
+
+```text
+feats/backchannel-layer/assets/Sakura/manifest.json
+```
+
+安装到本地 Sakura 角色包时,复制为:
+
+```text
+characters/sakura/backchannels/manifest.json
+```
+
+然后在该角色包的 `character.json` 中加入:
+
+```json
+{
+  "backchannel": "backchannels/manifest.json"
+}
+```
+
+保存后重启应用或切换角色,再到设置页启用“本地快速接话”。如果同时希望接话发声,还需要满足两层条件:
+
+- 全局 TTS 已启用且服务可用。
+- 设置页勾选“接话语音”。
+
+### 角色包分发约定
+
+角色接话文本应随角色资源分发,推荐结构:
+
+```text
+characters/<character_id>/
+  character.json
+  backchannels/
+    manifest.json
+    audio/
+      *.wav
+```
+
+`character.json` 没有 `backchannel` 字段,或字段指向的文件不存在时,该角色视为 opt-out。这样可以像角色卡一样自由切换/发布接话资源,不会把 Sakura 的硬编码话术绑定到框架本身。
