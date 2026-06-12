@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot, QtMsgType
 from PySide6.QtGui import QGuiApplication, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QStyleFactory
 
+from app.config.migration_runner import MigrationRunner
 from app.core.app_context import AppContext
 from app.core.bootstrap import build_deferred_services, build_initial_app_context
 from app.core.debug_log import debug_log
@@ -276,6 +277,16 @@ def main() -> int:
     if self_check.fatal_issues:
         QMessageBox.critical(None, "启动检查未通过", self_check.fatal_message())
         return 1
+
+    # 版本化数据迁移：失败不阻断启动（原文件保持原位，按旧形态继续运行，下次启动重试）
+    migration_report = MigrationRunner(BASE_DIR).run()
+    if migration_report.failed:
+        QMessageBox.warning(
+            None,
+            "数据迁移未完成",
+            "部分旧数据迁移失败，Sakura 将以兼容模式继续运行。\n"
+            "原数据未被修改，详情见运行日志（data/logs/sakura-runtime.log）。",
+        )
 
     try:
         context = build_initial_app_context(BASE_DIR)

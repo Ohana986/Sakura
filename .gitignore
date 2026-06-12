@@ -1,6 +1,7 @@
 .vscode/
 
 .env
+.env.migrated
 
 # macOS
 .DS_Store
