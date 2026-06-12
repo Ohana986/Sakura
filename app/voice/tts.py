@@ -26,20 +26,42 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 from app.voice.audio_sink_player import AudioSinkPlayer
 
-# 播放后端类型
-TTS_PLAYBACK_BACKEND_AUDIO_SINK = "audio_sink"
-TTS_PLAYBACK_BACKEND_MEDIA_PLAYER = "media_player"
-# 默认使用旧 QMediaPlayer 后端，待 audio_sink 验证稳定后再切换
-_DEFAULT_PLAYBACK_BACKEND = TTS_PLAYBACK_BACKEND_AUDIO_SINK
-
 from app.config.character_loader import CharacterProfile
 from app.core.gui_log import record_tts_service_output
 from app.llm.chat_reply import DEFAULT_TONE
 from app.core.debug_log import debug_log
 from app.core.interaction import get_interaction_id, set_interaction_id
 from app.storage.paths import StoragePaths
+# 配置数据模型与 provider 常量已拆至 tts_settings；此处 re-export 保持旧 import 路径可用
+from app.voice.tts_settings import (
+    DEFAULT_GENIE_TTS_API_URL,
+    DEFAULT_GPT_SOVITS_API_URL,
+    GPTSoVITSTTSSettings,
+    TTS_PLAYBACK_BACKEND_AUDIO_SINK,
+    TTS_PLAYBACK_BACKEND_MEDIA_PLAYER,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+    TTS_PROVIDER_GENIE,
+    TTS_PROVIDER_GPT_SOVITS,
+    TTS_PROVIDER_NONE,
+    TTSConfigError,
+    ToneReference,
+    _SUPPORTED_TTS_PROVIDERS,
+    _load_tone_references,
+    _normalize_lang,
+    _normalize_tts_provider,
+    _resolve_path,
+    _select_neutral_reference,
+)
+# 音频检查关卡已拆至 audio_checks；同样 re-export
+from app.voice.audio_checks import (
+    _is_valid_wav_file,
+    _verify_generated_audio,
+    _wav_duration_ms,
+)
 from app.voice.runtime_compat import find_usable_runtime_python, format_runtime_python_issue
 
+# 默认使用 AudioSink 后端
+_DEFAULT_PLAYBACK_BACKEND = TTS_PLAYBACK_BACKEND_AUDIO_SINK
 
 TTSCallback = Callable[[], None]
 _AUDIO_CLEANUP_DELAY_MS = 5000
@@ -50,18 +72,7 @@ _AUDIO_FINISH_FALLBACK_MIN_MS = 2000
 _AUDIO_FINISH_FALLBACK_MAX_MS = 60_000
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 _CJK_TEXT_LANGS = {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"}
-TTS_PROVIDER_NONE = "none"
-TTS_PROVIDER_GPT_SOVITS = "gpt-sovits"
-TTS_PROVIDER_CUSTOM_GPT_SOVITS = "custom-gpt-sovits"
-TTS_PROVIDER_GENIE = "genie-tts"
-DEFAULT_GPT_SOVITS_API_URL = "http://127.0.0.1:9880/tts"
-DEFAULT_GENIE_TTS_API_URL = "http://127.0.0.1:9881/"
 _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
-_SUPPORTED_TTS_PROVIDERS = {
-    TTS_PROVIDER_GPT_SOVITS,
-    TTS_PROVIDER_CUSTOM_GPT_SOVITS,
-    TTS_PROVIDER_GENIE,
-}
 
 
 def _resolve_project_root(base_dir: Path | None = None) -> Path:
@@ -343,138 +354,6 @@ class NullTTSProvider:
     def close(self) -> None:
         debug_log("TTS", "静音 Provider 无需关闭")
 
-
-class TTSConfigError(RuntimeError):
-    """TTS 配置缺失或格式错误。"""
-
-
-@dataclass(frozen=True)
-class ToneReference:
-    tone: str
-    ref_audio_path: Path
-    ref_text: str
-    ref_lang: str
-
-
-@dataclass(frozen=True)
-class GPTSoVITSTTSSettings:
-    enabled: bool
-    api_url: str
-    ref_audio_path: Path
-    ref_text_path: Path
-    ref_text: str
-    provider: str = TTS_PROVIDER_GPT_SOVITS
-    gpt_model_path: Path | None = None
-    sovits_model_path: Path | None = None
-    work_dir: Path | None = None
-    python_path: Path | None = None
-    tts_config_path: Path | None = None
-    character_name: str = ""
-    onnx_model_dir: Path | None = None
-    ref_lang: str = "ja"
-    text_lang: str = "ja"
-    timeout_seconds: int = 60
-    tone_references: dict[str, list[ToneReference]] = field(default_factory=dict)
-    playback_backend: str = ""
-
-    @classmethod
-    def from_character_profile(
-        cls,
-        character_profile: CharacterProfile,
-        enabled: bool,
-        api_url: str,
-        ref_lang: str,
-        text_lang: str,
-        timeout_seconds: int,
-        provider: str = TTS_PROVIDER_GPT_SOVITS,
-        work_dir: Path | None = None,
-        python_path: Path | None = None,
-        tts_config_path: Path | None = None,
-        onnx_model_dir: Path | None = None,
-        validate_enabled: bool = True,
-    ) -> "GPTSoVITSTTSSettings":
-        provider = _normalize_tts_provider(provider, enabled)
-        if character_profile.voice is None:
-            settings = cls(
-                provider=provider,
-                enabled=enabled,
-                api_url=api_url,
-                ref_audio_path=character_profile.package_dir,
-                ref_text_path=character_profile.package_dir,
-                ref_text="",
-                ref_lang=ref_lang,
-                text_lang=text_lang,
-                timeout_seconds=timeout_seconds,
-                work_dir=work_dir,
-                python_path=python_path,
-                tts_config_path=tts_config_path,
-                character_name=character_profile.display_name or character_profile.id,
-                onnx_model_dir=onnx_model_dir,
-            )
-            if enabled and validate_enabled:
-                settings.validate()
-            return settings
-
-        voice = character_profile.voice
-        tone_references = _load_tone_references(
-            voice.tone_ref_path,
-            character_profile.package_dir,
-        )
-        neutral_reference = _select_neutral_reference(tone_references)
-        settings = cls(
-            provider=provider,
-            enabled=enabled,
-            api_url=api_url,
-            ref_audio_path=neutral_reference.ref_audio_path if neutral_reference else character_profile.package_dir,
-            ref_text_path=neutral_reference.ref_audio_path if neutral_reference else character_profile.package_dir,
-            ref_text=neutral_reference.ref_text if neutral_reference else "",
-            gpt_model_path=voice.gpt_model_path,
-            sovits_model_path=voice.sovits_model_path,
-            work_dir=work_dir,
-            python_path=python_path,
-            tts_config_path=tts_config_path,
-            character_name=character_profile.display_name or character_profile.id,
-            onnx_model_dir=onnx_model_dir,
-            ref_lang=ref_lang,
-            text_lang=text_lang,
-            timeout_seconds=timeout_seconds,
-            tone_references=tone_references,
-        )
-        if enabled and validate_enabled:
-            settings.validate()
-        return settings
-
-    def validate(self) -> None:
-        if not self.api_url:
-            raise TTSConfigError("缺少 TTS API URL。")
-        if self.provider not in _SUPPORTED_TTS_PROVIDERS:
-            raise TTSConfigError(f"不支持的 TTS Provider：{self.provider}")
-        if self.python_path is not None and not self.python_path.exists():
-            raise TTSConfigError(f"TTS Python 不存在：{self.python_path}")
-        if self.tts_config_path is not None and not self.tts_config_path.exists():
-            raise TTSConfigError(f"GPT-SoVITS 推理配置不存在：{self.tts_config_path}")
-        if self.gpt_model_path is not None and not self.gpt_model_path.exists():
-            raise TTSConfigError(f"GPT 模型不存在：{self.gpt_model_path}")
-        if self.sovits_model_path is not None and not self.sovits_model_path.exists():
-            raise TTSConfigError(f"SoVITS 模型不存在：{self.sovits_model_path}")
-        if self.tone_references:
-            for references in self.tone_references.values():
-                for reference in references:
-                    if not reference.ref_audio_path.exists():
-                        raise TTSConfigError(f"语气参考音频不存在：{reference.ref_audio_path}")
-                    if not reference.ref_text:
-                        raise TTSConfigError(f"语气参考文本为空：{reference.ref_audio_path}")
-                    if not reference.ref_lang:
-                        raise TTSConfigError(f"语气参考语言为空：{reference.ref_audio_path}")
-        else:
-            if not self.ref_audio_path.exists():
-                raise TTSConfigError(f"参考音频不存在：{self.ref_audio_path}")
-            if not self.ref_text:
-                raise TTSConfigError("缺少参考文本，请配置 GPT_SOVITS_REF_TEXT 或 GPT_SOVITS_REF_TEXT_PATH。")
-        if not self.ref_lang:
-            raise TTSConfigError("缺少 GPT_SOVITS_REF_LANG。")
-        if not self.text_lang:
-            raise TTSConfigError("缺少 GPT_SOVITS_TEXT_LANG。")
 
 class GPTSoVITSTTSProvider(QObject):
     error_occurred = Signal(str)
@@ -2532,81 +2411,6 @@ def _read_local_tts_output(stream, log_path: Path, provider: str) -> None:  # ty
             pass
 
 
-def _resolve_path(path_text: str, base_dir: Path) -> Path:
-    path = Path(path_text.strip().strip('"').strip("'"))
-    if path.is_absolute():
-        return path
-    return base_dir / path
-
-
-def _normalize_tts_provider(provider: str, enabled: bool = True) -> str:
-    if not enabled:
-        return TTS_PROVIDER_NONE
-    normalized = provider.strip().lower().replace("_", "-")
-    if normalized in {"", "gptsovits"}:
-        return TTS_PROVIDER_GPT_SOVITS
-    if normalized in {"gpt-so-vits", "gpt-sovits"}:
-        return TTS_PROVIDER_GPT_SOVITS
-    if normalized in {"custom-gpt-sovits", "external-gpt-sovits", "custom-sovits", "external-sovits"}:
-        return TTS_PROVIDER_CUSTOM_GPT_SOVITS
-    if normalized in {"genie", "genie-tts", "genietts"}:
-        return TTS_PROVIDER_GENIE
-    if normalized in {"none", "off", "disabled", "不使用"}:
-        return TTS_PROVIDER_NONE
-    return normalized
-
-
-def _load_tone_references(ref_path: Path | None, base_dir: Path) -> dict[str, list[ToneReference]]:
-    if ref_path is None or not ref_path.exists():
-        return {}
-
-    tone_references: dict[str, list[ToneReference]] = {}
-    for raw_line in ref_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        parts = [part.strip() for part in line.split("|")]
-        if len(parts) != 4:
-            continue
-
-        audio_text, lang, prompt_text, tone = parts
-        audio_path = _resolve_path(audio_text, base_dir)
-        copied_path = ref_path.parent / "tone_refs" / audio_path.name
-        if copied_path.exists():
-            audio_path = copied_path
-
-        tone_key = tone or DEFAULT_TONE
-        reference = ToneReference(
-            tone=tone_key,
-            ref_audio_path=audio_path,
-            ref_text=prompt_text,
-            ref_lang=_normalize_lang(lang),
-        )
-        tone_references.setdefault(tone_key, []).append(reference)
-
-    return tone_references
-
-
-def _select_neutral_reference(
-    tone_references: dict[str, list[ToneReference]],
-) -> ToneReference | None:
-    neutral_references = tone_references.get(DEFAULT_TONE)
-    if neutral_references:
-        return neutral_references[0]
-    for references in tone_references.values():
-        if references:
-            return references[0]
-    return None
-
-
-def _normalize_lang(lang: str) -> str:
-    normalized = lang.strip().lower()
-    if normalized == "ja":
-        return "ja"
-    return normalized or "ja"
-
-
 def _resolve_request_text_lang(text: str, configured_text_lang: str) -> str:
     """英文混入中日韩文本时切到 auto，避免 GPT-SoVITS 按单语 BERT 处理失败。"""
     normalized = configured_text_lang.strip().lower()
@@ -2708,59 +2512,3 @@ def _write_raw_float_or_pcm_as_wav(raw_bytes: bytes, output_path: Path, *, sampl
     return _write_raw_pcm_as_wav(pcm_bytes, output_path, sample_rate=sample_rate)
 
 
-def _verify_generated_audio(path: Path) -> str | None:
-    """音频文件统一检查关卡：生成后入队前、播放前各过一次。
-
-    返回 None 表示通过；否则返回错误码，日志可借此区分：
-    audio_file_missing / audio_file_empty / audio_file_unreadable / audio_format_invalid
-    """
-    path = Path(path)
-    if not path.is_file():
-        return "audio_file_missing"
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return "audio_file_unreadable"
-    if size <= 0:
-        return "audio_file_empty"
-    try:
-        with path.open("rb") as handle:
-            handle.read(16)
-    except OSError:
-        return "audio_file_unreadable"
-    try:
-        with wave.open(str(path), "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            frame_rate = wav_file.getframerate()
-    # wave 对截断文件抛 EOFError，不属于 wave.Error，需单独捕获
-    except (OSError, wave.Error, EOFError):
-        return "audio_format_invalid"
-    if channels not in (1, 2) or sample_width <= 0 or frame_rate <= 0:
-        return "audio_format_invalid"
-    return None
-
-
-def _wav_duration_ms(path: Path) -> int | None:
-    try:
-        with wave.open(str(path), "rb") as wav_file:
-            frame_rate = wav_file.getframerate()
-            frame_count = wav_file.getnframes()
-    except (OSError, wave.Error, EOFError):
-        return None
-    if frame_rate <= 0 or frame_count < 0:
-        return None
-    return max(1, int(frame_count * 1000 / frame_rate))
-
-
-def _is_valid_wav_file(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        with wave.open(str(path), "rb") as wav_file:
-            wav_file.getnchannels()
-            wav_file.getframerate()
-            wav_file.getnframes()
-    except (OSError, wave.Error, EOFError):
-        return False
-    return True
