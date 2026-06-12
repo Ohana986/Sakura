@@ -6445,6 +6445,8 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
         _handle_progress_reply = PetWindow._handle_progress_reply
 
     window = MinimalProgressWindow()
+    from app.ui.state import PetUiStateStore
+    window.ui_state = PetUiStateStore()
     history = []
     window.messages = [{"role": "user", "content": "查一下"}]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
@@ -6475,6 +6477,8 @@ def test_progress_reply_records_segments_as_separate_history_entries() -> None:
         _record_assistant_reply_history = PetWindow._record_assistant_reply_history
 
     window = MinimalProgressWindow()
+    from app.ui.state import PetUiStateStore
+    window.ui_state = PetUiStateStore()
     history = []
     window.messages = [{"role": "user", "content": "查一下"}]
     window._log_interaction_stage = lambda *_args, **_kwargs: None

@@ -82,6 +82,7 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.debug_log import debug_log, summarize_messages
 from app.core.interaction import clear_interaction_id, set_interaction_id
+from app.ui.state import PetUiStateStore
 from app.config.settings_service import BubbleSettings, StartupSettings
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
@@ -448,6 +449,8 @@ class PetWindow(QWidget):
         self.active_interaction_id = ""
         self.active_interaction_started_at: float | None = None
         self.active_interaction_last_at: float | None = None
+        # UI 统一状态源：thinking/streaming/speaking/error 的唯一权威
+        self.ui_state = PetUiStateStore(self)
         self.reply_history_segments: list[ChatSegment] = []
         self.reply_history_index: int | None = None
         self.reply_history_review_active = False
@@ -983,6 +986,7 @@ class PetWindow(QWidget):
         # 高度重置由 _collapse_auto_fit_bubble_height 在 cancel_reply_flow 前统一处理。
         self.portrait_controller.apply_for_segment(segment)
         self._sync_reply_history_index_for_segment(segment)
+        self.ui_state.begin_speaking("reply_segment")
         # 新台词开始：保持气泡显示并暂停自动隐藏倒计时。
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
@@ -1452,6 +1456,7 @@ class PetWindow(QWidget):
         self.active_interaction_last_at = now
         # UI 线程后续的 debug_log 自动带上交互 ID；worker/TTS 线程由各自入口恢复
         set_interaction_id(self.active_interaction_id)
+        self.ui_state.begin_thinking(source)
         debug_log(
             "Latency",
             "输入事件开始",
@@ -1500,6 +1505,9 @@ class PetWindow(QWidget):
         self.active_interaction_started_at = None
         self.active_interaction_last_at = None
         clear_interaction_id()
+        # 失败结局保持 ERROR 状态供动效展示，直到下一次交互进入 thinking
+        if outcome != "error":
+            self.ui_state.finish(outcome)
         self._update_reply_history_buttons()
         # 每完成一轮对话（含完整回复）累计一次，驱动自动记忆整理触发
         if outcome == "reply_completed":
@@ -1788,6 +1796,7 @@ class PetWindow(QWidget):
         reply = progress.reply
         if not reply.text.strip():
             return
+        self.ui_state.begin_streaming(progress.stage)
         self._log_interaction_stage(
             "agent_progress_received",
             {
@@ -2404,6 +2413,7 @@ class PetWindow(QWidget):
     @Slot(str)
     def _handle_error(self, message: str) -> None:
         self._log_interaction_stage("worker_error", {"message": message})
+        self.ui_state.fail("worker_error")
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()
         self._record_history("error", message)
