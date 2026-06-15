@@ -75,19 +75,19 @@ if importlib.util.find_spec("PySide6") is None:
 from app.voice.tts import (
     GenieTTSProvider,
     GPTSoVITSTTSProvider,
-    GPTSoVITSTTSSettings,
     TTSPreparedAudio,
     _build_gpt_sovits_start_command,
     _build_genie_endpoint_url,
     _format_gpt_sovits_http_error,
-    _load_tone_references,
     _local_tts_subprocess_env,
     _read_local_tts_output,
     _resolve_request_text_lang,
     _resolve_tts_cache_dir,
+    _TTSRequest,
     _write_genie_audio,
     purge_tts_cache,
 )
+from app.voice.tts_settings import GPTSoVITSTTSSettings, _load_tone_references
 from app.core.gui_log import GUI_LOG_SCOPE_TTS, clear_gui_logs, get_gui_log_buffer
 from app.voice import VoicePlaybackController
 from app.voice.text_language_guard import should_skip_tts_text
@@ -174,6 +174,26 @@ def test_tts_provider_can_skip_constructor_service_adoption(monkeypatch) -> None
     assert calls == ["GPTSoVITSTTSProvider"]
 
 
+def test_tts_provider_close_clears_queue_and_blocks_late_requests() -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    provider._pending_requests.append(_TTSRequest(text="queued", tone=None))
+
+    provider.close()
+
+    assert provider._is_closed()
+    assert provider._pending_requests == []
+
+    provider.speak("late request")
+
+    assert provider._pending_requests == []
+
+    provider._pending_requests.append(_TTSRequest(text="stale", tone=None))
+    provider._start_next_request()
+
+    assert not provider._request_running
+    assert [request.text for request in provider._pending_requests] == ["stale"]
+
+
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     provider = types.SimpleNamespace()
     provider.settings = _minimal_tts_settings()
@@ -252,6 +272,7 @@ def test_genie_service_probe_adopts_existing_local_process_when_port_is_ready(mo
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
 
     class FakeConnection:
         def __enter__(self) -> "FakeConnection":
@@ -322,6 +343,7 @@ def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch)
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     connection_calls = 0
     popen_calls: list[list[str]] = []
@@ -404,6 +426,7 @@ def test_tts_service_waits_past_thirty_seconds_for_slow_gptsovits_start(monkeypa
     provider.settings = replace(_minimal_tts_settings(work_dir=work_dir), timeout_seconds=55)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     debug_messages: list[tuple[str, object]] = []
     elapsed = 0.0
@@ -460,6 +483,7 @@ def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
 
     def fake_create_connection(*_args: object, **_kwargs: object) -> object:
@@ -483,6 +507,7 @@ def test_tts_service_probe_reports_incompatible_windows_runtime_on_macos(monkeyp
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
 
     def fake_create_connection(*_args: object, **_kwargs: object) -> object:
@@ -559,6 +584,7 @@ def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) 
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     connection_calls = 0
     popen_calls: list[list[str]] = []
@@ -652,6 +678,7 @@ def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monke
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9880/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     service_started = False
     popen_calls: list[list[str]] = []
@@ -887,9 +914,11 @@ def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) ->
 
     class TimerStub:
         @staticmethod
-        def singleShot(_interval: int, callback) -> None:  # type: ignore[no-untyped-def]
+        def singleShot(interval: int, callback) -> None:  # type: ignore[no-untyped-def]
             calls.append("timer")
-            callback()
+            # 只立即执行 warm_up 的 0 延迟回调；播放完成兜底（delay>0）仅记录
+            if interval == 0:
+                callback()
 
     class SignalStub:
         def connect(self, *_args: object, **_kwargs: object) -> None:
@@ -932,6 +961,9 @@ def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) ->
     monkeypatch.setattr(tts_module, "QMediaPlayer", MediaPlayerStub)
 
     provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
+    # 本测试验证 QMediaPlayer 预热复用；旧版靠"假文件让 sink 失败再 fallback"
+    # 隐式走到 media_player，播放前校验引入后显式指定后端
+    provider._playback_backend = "media_player"
 
     assert calls == []
 
@@ -939,10 +971,13 @@ def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) ->
 
     assert calls == ["timer", "audio", "player"]
 
-    provider._pending_audio.append((Path("dummy.wav"), None, None, None, ""))
+    warmup_audio = _runtime_root("warmup_play") / "dummy.wav"
+    _write_silence_wav(warmup_audio, frame_count=1600, frame_rate=16000)
+    provider._pending_audio.append((warmup_audio, None, None, None, ""))
     provider._play_next()
 
-    assert calls == ["timer", "audio", "player", "source", "play"]
+    # 播放后会追加一个播放完成兜底定时器（delay>0，仅记录不执行）
+    assert calls == ["timer", "audio", "player", "source", "play", "timer"]
 
 
 def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -994,9 +1029,14 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
     provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
     provider._playback_backend = "media_player"  # force media_player for this legacy test
     monkeypatch.setattr(provider, "_schedule_audio_cleanup", lambda path: cleaned.append(path))
+    stopped_root = _runtime_root("stopped_state_finish")
+    first_audio = stopped_root / "first.wav"
+    second_audio = stopped_root / "second.wav"
+    _write_silence_wav(first_audio, frame_count=1600, frame_rate=16000)
+    _write_silence_wav(second_audio, frame_count=1600, frame_rate=16000)
     provider._pending_audio.append(
         (
-            Path("first.wav"),
+            first_audio,
             lambda: events.append("first_started"),
             lambda: events.append("first_finished"),
             None,
@@ -1005,7 +1045,7 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
     )
     provider._pending_audio.append(
         (
-            Path("second.wav"),
+            second_audio,
             lambda: events.append("second_started"),
             lambda: events.append("second_finished"),
             None,
@@ -1018,8 +1058,8 @@ def test_tts_provider_treats_started_stopped_state_as_audio_finished(monkeypatch
     provider._handle_playback_state(MediaPlayerStub.PlaybackState.StoppedState)
 
     assert events == ["play", "first_started", "stop", "first_finished", "play"]
-    assert cleaned == [Path("first.wav")]
-    assert provider._current_audio == Path("second.wav")
+    assert cleaned == [first_audio]
+    assert provider._current_audio == second_audio
     assert len(sources) == 3
 
 
@@ -1576,7 +1616,7 @@ def test_handle_media_status_passes_reason_to_finish(monkeypatch) -> None:  # ty
 def test_playback_backend_is_configurable() -> None:
     """playback backend should be readable from settings, defaulting to media_player."""
     from dataclasses import replace as dc_replace
-    from app.voice.tts import (
+    from app.voice.tts_settings import (
         TTS_PLAYBACK_BACKEND_MEDIA_PLAYER,
         TTS_PLAYBACK_BACKEND_AUDIO_SINK,
     )
