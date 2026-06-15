@@ -4148,6 +4148,14 @@ class PetWindow(QWidget):
         )
 
     def _show_reply_segments(self, segments: list[ChatSegment]) -> None:
+        # 正式回复分段即将进入串行 TTS 合成队列:先让未就绪的接话预生成请求让位。
+        # 不能只依赖 _apply_reply_segment 里的 _cancel_backchannel——那是 TTS
+        # on_started 回调,等它触发时回复音频早已排在一整队接话 prepare 之后,
+        # 等待动效停不下来(回复卡在"等待中"),被丢弃的接话还会被反复重排合成。
+        # 用 getattr 取方法以兼容仅挂载部分方法的精简测试桩。
+        cancel_backchannel = getattr(self, "_cancel_backchannel", None)
+        if callable(cancel_backchannel):
+            cancel_backchannel()
         self._exit_reply_history_review(update_buttons=False)
         self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)

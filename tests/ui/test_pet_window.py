@@ -2129,6 +2129,67 @@ def test_pet_window_reply_arrival_discards_unready_backchannel_prepares() -> Non
     assert len(remaining) == 1 and remaining[0].text == "ready"
 
 
+def test_pet_window_show_reply_segments_discards_backchannel_before_play() -> None:
+    """回复分段进入串行 TTS 队列前,未就绪的接话 prepare 必须先让位。
+
+    否则回复音频会排在一整队接话 prepare 之后,on_started 迟迟不触发,
+    等待动效停不下来(回复卡在"等待中"),被让位的接话还会反复重排合成。
+    """
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.discarded: list[str] = []
+
+        def discard_prepared(self, handle: TTSPreparedAudio) -> None:
+            self.discarded.append(handle.text)
+
+    class ControllerStub:
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        def cancel(self) -> None:
+            self.cancelled += 1
+
+    class SubtitleStub:
+        def __init__(self, provider: ProviderStub) -> None:
+            self._provider = provider
+            self.shown: list[list[ChatSegment]] = []
+            # 记录 show_segments 触发那一刻"已被丢弃的接话",用于验证让位发生在排队之前
+            self.discarded_before_show: list[str] | None = None
+
+        def show_segments(self, segments: list[ChatSegment]) -> None:
+            self.discarded_before_show = list(self._provider.discarded)
+            self.shown.append(segments)
+
+    class WindowStub:
+        _show_reply_segments = PetWindow._show_reply_segments
+        _cancel_backchannel = PetWindow._cancel_backchannel
+        _discard_unready_backchannel_audio = PetWindow._discard_unready_backchannel_audio
+        _discard_active_backchannel_audio = PetWindow._discard_active_backchannel_audio
+
+        def __init__(self) -> None:
+            self.tts_provider = ProviderStub()
+            self.backchannel_controller = ControllerStub()
+            self.subtitle_controller = SubtitleStub(self.tts_provider)
+            self._active_backchannel_audio = None
+            unready = TTSPreparedAudio(text="つなぎ", tone="中性")
+            self._backchannel_prepared_audio = {("b", "中性", "つなぎ"): unready}
+            self._exit_reply_history_review = lambda update_buttons=False: None
+            self._remember_reply_history_segments = lambda segments: None
+
+    window = WindowStub()
+    segment = ChatSegment("本題だよ。", "中性", "正题来了。", "站立待机")
+    window._show_reply_segments([segment])
+
+    # 接话控制器已取消、未就绪 prepare 已丢弃,且二者都发生在 show_segments 之前
+    assert window.backchannel_controller.cancelled == 1
+    assert window.tts_provider.discarded == ["つなぎ"]
+    assert window.subtitle_controller.discarded_before_show == ["つなぎ"]
+    assert window.subtitle_controller.shown == [[segment]]
+
+
 def test_pet_window_backchannel_audio_waits_for_tts_service_ready() -> None:
     """服务未就绪时预生成被门控跳过,预热成功回调后补做(避免首批 HTTP 静默失败)。"""
     from app.backchannel.models import (
