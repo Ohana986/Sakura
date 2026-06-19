@@ -97,6 +97,7 @@ from app.backchannel.eval_log import BackchannelEvalLogger
 from app.backchannel.models import BackchannelLabel, BackchannelManifest
 from app.backchannel.resolver import BackchannelChoice
 from app.core.interaction import clear_interaction_id, set_interaction_id
+from app.core.resource_manager import ResourceManager
 from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
 from app.plugins.manager import (
@@ -577,8 +578,8 @@ class PetWindow(QWidget):
         self.pet_hidden_at: float | None = None
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
-        self._shutdown_lingering_threads: list[tuple[QThread, QObject | None]] = []
-        self._retired_qobject_wrappers: list[QObject] = []
+        # 后台线程生命周期、lingering 线程与退役 wrapper 统一由资源管理器治理。
+        self.resource_manager = ResourceManager(self)
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
@@ -1249,57 +1250,14 @@ class PetWindow(QWidget):
     def _shutdown_qthread(self, thread_attr: str, worker_attr: str) -> None:
         thread = getattr(self, thread_attr, None)
         worker = getattr(self, worker_attr, None)
-        if thread is None:
+        # 关闭机制（cancel→interrupt→quit→wait→lingering）由资源管理器统一执行；
+        # 干净停止时清空宿主属性，超时 lingering 时保留属性（与旧行为一致）。
+        cleanly_stopped = self.resource_manager.stop_qt_thread(
+            thread, worker, label=thread_attr
+        )
+        if cleanly_stopped:
+            setattr(self, thread_attr, None)
             setattr(self, worker_attr, None)
-            return
-        debug_log("PetWindow", "准备关闭后台线程", {"thread": thread_attr})
-        try:
-            cancel = getattr(worker, "cancel", None)
-            if callable(cancel):
-                cancel()
-            thread.requestInterruption()
-            if thread.isRunning():
-                thread.quit()
-                if not thread.wait(THREAD_SHUTDOWN_WAIT_MS):
-                    debug_log(
-                        "PetWindow",
-                        "后台线程未在退出等待时间内结束",
-                        {"thread": thread_attr, "wait_ms": THREAD_SHUTDOWN_WAIT_MS},
-                    )
-                    self._keep_shutdown_lingering_thread(thread, worker)
-                    return
-        except RuntimeError as exc:
-            debug_log("PetWindow", "关闭后台线程失败", {"thread": thread_attr, "error": str(exc)})
-        setattr(self, thread_attr, None)
-        setattr(self, worker_attr, None)
-
-    def _keep_shutdown_lingering_thread(self, thread: QThread, worker: QObject | None) -> None:
-        if any(item_thread is thread for item_thread, _worker in self._shutdown_lingering_threads):
-            return
-        self._shutdown_lingering_threads.append((thread, worker))
-        try:
-            thread.finished.connect(lambda _thread=thread: self._release_shutdown_lingering_thread(_thread))
-        except RuntimeError:
-            self._release_shutdown_lingering_thread(thread)
-
-    def _release_shutdown_lingering_thread(self, thread: QThread) -> None:
-        remaining: list[tuple[QThread, QObject | None]] = []
-        released_worker: QObject | None = None
-        for item_thread, item_worker in self._shutdown_lingering_threads:
-            if item_thread is thread:
-                released_worker = item_worker
-                continue
-            remaining.append((item_thread, item_worker))
-        self._shutdown_lingering_threads = remaining
-        if released_worker is not None:
-            try:
-                released_worker.deleteLater()
-            except RuntimeError:
-                pass
-        try:
-            thread.deleteLater()
-        except RuntimeError:
-            pass
 
     def _emit_app_started_event(self) -> None:
         """启动就绪后落盘 app.started；若存在上次关闭记录则附带跨会话信息并注入首条消息。"""
@@ -3381,41 +3339,8 @@ class PetWindow(QWidget):
         self.screen_observation_encode_worker = None
 
     def _retain_qobject_wrappers_until_deleted(self, *objects: QObject | None) -> None:
-        """Keep PySide wrappers alive until Qt has processed deleteLater.
-
-        A queued Qt signal can reach Python while Qt is already tearing down the
-        same QObject. If assigning an attribute drops the final Python wrapper
-        reference at that point, Shiboken may try to destroy an object whose C++
-        lifetime is already controlled by Qt. Retaining wrappers briefly avoids
-        that double-destruction window; invalid wrappers are pruned later.
-        """
-        retained = [obj for obj in objects if obj is not None]
-        if not retained:
-            return
-        wrappers = getattr(self, "_retired_qobject_wrappers", None)
-        if wrappers is None:
-            wrappers = []
-            self._retired_qobject_wrappers = wrappers
-        wrappers.extend(retained)
-        QTimer.singleShot(1000, self._prune_retired_qobject_wrappers)
-
-    @Slot()
-    def _prune_retired_qobject_wrappers(self) -> None:
-        wrappers = getattr(self, "_retired_qobject_wrappers", None)
-        if not wrappers:
-            return
-        try:
-            import shiboken6
-        except ImportError:
-            return
-        alive: list[QObject] = []
-        for wrapper in wrappers:
-            try:
-                if shiboken6.isValid(wrapper):
-                    alive.append(wrapper)
-            except (RuntimeError, TypeError):
-                pass
-        self._retired_qobject_wrappers = alive
+        """委托资源管理器保留退役 wrapper，避开 Shiboken 双重析构窗口。"""
+        self.resource_manager.retain_wrappers(*objects)
 
     def _resume_screen_observation_followup_cleanup(self) -> None:
         if getattr(self, "_shutdown_in_progress", False):

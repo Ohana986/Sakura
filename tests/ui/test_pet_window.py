@@ -847,6 +847,7 @@ def test_emit_app_closed_event_logs_once_with_interrupted_flag() -> None:
 
 
 def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
+    from app.core.resource_manager import ResourceManager
     from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class SignalStub:
@@ -893,15 +894,13 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     class MinimalWindow:
         close_external_tools = PetWindow.close_external_tools
         _shutdown_qthread = PetWindow._shutdown_qthread
-        _keep_shutdown_lingering_thread = PetWindow._keep_shutdown_lingering_thread
-        _release_shutdown_lingering_thread = PetWindow._release_shutdown_lingering_thread
 
     window = MinimalWindow()
     thread = ThreadStub()
     worker = WorkerStub()
     subtitle = SubtitleStub()
     window._shutdown_in_progress = False
-    window._shutdown_lingering_threads = []
+    window.resource_manager = ResourceManager()
     window.messages = [
         {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
     ]
@@ -930,7 +929,7 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     assert thread.interrupted is True
     assert thread.quit_called is True
     assert thread.waits == [1000]
-    assert window._shutdown_lingering_threads == [(thread, worker)]
+    assert window.resource_manager._lingering == [(thread, worker)]
     assert window.messages == []
     assert subtitle.cancelled is True
 
