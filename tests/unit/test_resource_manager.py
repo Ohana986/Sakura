@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import time
@@ -18,10 +19,13 @@ from PySide6.QtCore import (  # noqa: E402
 )
 
 from app.core.resource_manager import (  # noqa: E402
+    AsyncLoopResource,
     ProcessResource,
     QtWorkerResource,
     ResourceManager,
+    ResourceRegistry,
     ResourceState,
+    ServiceResource,
     ThreadGroupResource,
     ThreadResource,
 )
@@ -220,9 +224,72 @@ def test_stop_all_stops_every_registered_resource() -> None:
             order.append((self.name, timeout))
             return True
 
-    mgr._resources.extend([_Res("a"), _Res("b"), _Res("c")])  # type: ignore[list-item]
+    mgr._register(_Res("a"), label="a")
+    mgr._register(_Res("b"), label="b")
+    mgr._register(_Res("c"), label="c")
     mgr.stop_all(500)
     assert order == [("a", 500), ("b", 500), ("c", 500)]
+
+
+def test_resource_registry_stop_all_uses_shutdown_order() -> None:
+    registry = ResourceRegistry()
+    order: list[str] = []
+
+    registry.track_service(stop=lambda: order.append("low"), label="low", shutdown_order=10)
+    registry.track_service(stop=lambda: order.append("high"), label="high", shutdown_order=30)
+    registry.track_service(stop=lambda: order.append("mid"), label="mid", shutdown_order=20)
+
+    registry.stop_all(500)
+
+    assert order == ["high", "mid", "low"]
+    assert registry._resources == []
+
+
+def test_resource_registry_stop_all_is_idempotent_for_services() -> None:
+    registry = ResourceRegistry()
+    calls: list[str] = []
+    res = registry.track_service(stop=lambda: calls.append("stop"), label="svc")
+
+    assert isinstance(res, ServiceResource)
+    registry.stop_all()
+    registry.stop_all()
+
+    assert calls == ["stop"]
+    assert res not in registry._resources
+
+
+def test_resource_registry_service_exception_does_not_block_next_resource() -> None:
+    registry = ResourceRegistry()
+    calls: list[str] = []
+
+    def bad_stop() -> None:
+        calls.append("bad")
+        raise RuntimeError("boom")
+
+    registry.track_service(stop=bad_stop, label="bad", shutdown_order=20)
+    registry.track_service(stop=lambda: calls.append("good"), label="good", shutdown_order=10)
+
+    registry.stop_all()
+
+    assert calls == ["bad", "good"]
+    assert registry._resources == []
+
+
+def test_async_loop_resource_submit_stop_and_restart() -> None:
+    registry = ResourceRegistry()
+    res = registry.track_async_loop(label="mcp-test")
+
+    assert isinstance(res, AsyncLoopResource)
+    res.start(name="mcp-test-loop")
+    assert res.submit(asyncio.sleep(0, result="ok"), timeout=1) == "ok"
+
+    assert res.stop(timeout_ms=1000) is True
+    assert res.is_running() is False
+    assert res not in registry._resources
+
+    assert res.restart(reason="unit-test") is True
+    assert res.submit(asyncio.sleep(0, result="again"), timeout=1) == "again"
+    assert res.stop(timeout_ms=1000) is True
 
 
 # --- retain_wrappers / prune ---------------------------------------------

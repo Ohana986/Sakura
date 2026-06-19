@@ -1,56 +1,73 @@
-# 交接：Sakura issue #94 资源管理器重构（第 3 阶段起）
+# 交接：Sakura issue #94 资源管理器重构（第 5 阶段后）
 
-> 给下一个会话的上下文交接。配合 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md`（设计文档）一起读。
+> 给后续会话的上下文交接。配合 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md`（设计文档）和
+> `docs/RESOURCE_MANAGER_PHASE_4_5_PLAN.md`（第 4/5 阶段实施记录）一起读。
 
 ## 项目与分支
-- 仓库根目录：`C:\Users\LBW\MyFile\sakura-project\Sakura`（PySide6/Qt 桌宠，Windows）
-- 当前分支：`refactor/resource-manager`（从 `origin/dev` 切出），第 1+2+3 阶段已完成，**未推送**。
-- issue #94：把散落在 `PetWindow`（6700+ 行）里的 Qt/Python/进程生命周期，分 5 阶段抽到统一的后端资源管理器。
+- 仓库根目录：`C:\Users\LBW\MyFile\sakura-project\Sakura`（PySide6/Qt 桌宠，Windows）。
+- 当前分支：`refactor/resource-manager`。issue #94 的第 1-5 阶段核心改造已完成。
+- 用 `./runtime/python.exe -m pytest ...` 运行测试，不要用系统 Python。
 
-## 已完成（第 1+2 阶段，4 个提交）
-1. 设计文档 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md`
-2. 新增 `app/core/resource_manager.py`：
-   - `QtWorkerResource`：托管一对 `QThread+QObject worker`；`stop()` 复刻 `cancel→requestInterruption→quit→wait→linger`；`_finalize()` 负责 wrapper 保留 + deleteLater + 清空宿主属性 + 调 `on_finished` 业务回调。
-   - `ResourceManager(QObject)`：`spawn_qt_worker(...)` 工厂、`stop_all()`、`stop_qt_thread()` 原语、`retain_wrappers()`/prune、lingering 线程管理。`spawn_qt_worker` 有 `register=False` 选项（不纳入 `stop_all` 清单）。
-   - 单测 `tests/unit/test_resource_manager.py`（10 个，全绿）。
-3. 第 1 阶段：`PetWindow.__init__` 建 `self.resource_manager = ResourceManager(self)`；`_shutdown_qthread`/lingering/wrapper 委托给管理器。
-4. 第 2 阶段：**7 个** QThread worker 创建点全部迁到 `spawn_qt_worker`（ChatWorker 聊天+动作、EventWorker、MemoryCurationWorker、ScreenObservationEncodeWorker、TTSReadyWarmupWorker、DeferredStartupWorker、TTSBundleMigrationWorker[用 register=False]）；`close_external_tools` 改用 `stop_all`；删了 `_shutdown_qthread` 和两个空 cleanup 方法，cleanup 方法只剩业务逻辑。
+## 已完成
+1. 第 1+2 阶段：`QtWorkerResource` 与 `ResourceManager(QObject)` 接管 PetWindow 的 QThread worker 生命周期、
+   lingering QThread 与 Shiboken wrapper 保留窗口。
+2. 第 3 阶段：TTS Provider 拆分为服务进程、合成队列、播放端点；`ThreadResource` / `ProcessResource`
+   接入资源层。
+3. 第 4 阶段：Backchannel 分类线程由 `ThreadGroupResource` 管理；`PetWindow.close_external_tools()`
+   只保留即时 `cancel()`，join/lingering 统一走 `resource_manager.stop_all()`。
+4. 第 5 阶段：建立 App 级 `ResourceRegistry`，`ResourceManager(QObject)` 作为 Qt wrapper 持有同一个 registry。
+   - `AppContext.resource_registry` 由 bootstrap 创建并传给 MemoryStore、PluginManager、MCP provider 等服务。
+   - `ServiceResource` / `AsyncLoopResource` 已落地。
+   - MCP bridge 的 asyncio loop + daemon thread 由 `AsyncLoopResource` 托管，Provider 自身注册为 service。
+   - MemoryStore 的 preload/reload 线程由 `ThreadGroupResource` 托管，新增 `close()` 失效迟到结果并关闭 runtime。
+   - PluginManager 接 shared registry，`shutdown_all()` 幂等；`PluginServices.resources` 允许插件登记 cleanup/thread/executor。
+   - 内置 `playwright_browser` 通过资源门面登记 `browser.shutdown_browser()`，`shutdown()` 只作兼容兜底。
+   - PetWindow 主关闭链路收敛为：发关闭事件、取消 UI 流、`resource_manager.stop_all()`。
 
 ## 必须保持的约束
-- 关闭序列、Shiboken wrapper 保留窗口、QThread 仍 parent 到窗口（否则 `tests/conftest.py:_cleanup_qt_objects` 靠 `children()` 递归回收不到线程）。
-- `PetWindow` 仍持有 `self.worker`/`self.worker_thread` 等属性（指向管理器创建的对象），不要打断现有处理器与测试断言。
-- 插件只能经 service facade，不得接触 PetWindow/TTS 内部实例。
+- `QWidget` / `QPixmap` / `QMediaPlayer` / `QAudioOutput` / Qt UI timer 仍留在 UI 主线程。
+- `PetWindow` 仍持有 `self.worker` / `self.worker_thread` 等属性，避免打断现有处理器与测试断言。
+- 插件只能经 service facade；不要让插件接触 `PetWindow`、TTS provider 内部对象或全局 ResourceManager。
+- `MemoryStore.close()` 必须先失效 generation，再停登记线程，最后关闭当前 runtime。
+- `close_external_tools()` 不再手写串联 `close_tts_tools()` / `close_mcp_tools()` / `close_plugins()` /
+  `_close_renderer_manager()`；这些入口只保留为测试、设置热切换或兜底调用。
 
-## 测试怎么跑（重要）
-- **用 `./runtime/python.exe -m pytest ...`**，不要用系统 Python（Anaconda 的 PySide6 会崩 0xc0000139）。
-- 已知 2 个**环境性**失败、与重构无关：`tests/ui/test_history_window.py` 需要 qtbot（runtime 没装 pytest-qt）；`test_public_api_cleanup.py::test_legacy_sdk_package_is_removed` 因工作树里有残留未跟踪的 `sdk/` 目录。CI 下不会出现。
-- 回归验证命令：`./runtime/python.exe -m pytest tests/unit/test_resource_manager.py tests/ui/test_pet_window.py tests/ui/test_backchannel_controller.py -q -p no:warnings`
+## 验证命令
+已验证：
 
-## 第 3 阶段——拆分 TTS Provider（已完成）
-原 `app/voice/tts.py` 的 `GPTSoVITSTTSProvider`（QObject）混的三类职责已拆分（详见
-`docs/TTS_PROVIDER_SPLIT_PLAN.md` §8 完成记录），落地为 6 个提交：
-- `app/voice/tts_types.py`：共享类型（`TTSPreparedAudio`/`_TTSRequest`/`TTSServiceState` 等）
-- `app/voice/tts_service.py`：`TTSServiceSupervisor`(+`GenieServiceSupervisor`)——本地子进程
-  探测/启动/接管/Broken pipe 重启/权重·模型加载；子进程经 `ProcessResource` 托管
-- `app/voice/tts_synthesis.py`：`TTSSynthesisQueue` + `GPTSoVITSSynthesisEngine`/
-  `GenieSynthesisEngine`——合成线程经 `ThreadResource` 托管
-- `app/voice/tts_playback.py`：`TTSPlaybackEndpoint`（UI 主线程子 QObject，随协调器 moveToThread）
-- `app/voice/tts.py`：瘦身为「装配 + 委托」协调器 + `NullTTSProvider` + `TTSProvider` 协议；
-  `GenieTTSProvider` 不再有继承覆写，差异由 `settings.provider` 在协调器内选型；
-  `close()` 走协调器自持 `ResourceManager.stop_all`
-- `ResourceManager` 增 `ThreadResource`/`ProcessResource`/`ResourceState` 与泛化注册表
+```powershell
+./runtime/python.exe -m pytest tests/unit/test_resource_manager.py tests/ui/test_backchannel_controller.py tests/ui/test_pet_window.py::test_close_external_tools_cancels_and_keeps_lingering_thread tests/ui/test_pet_window.py::test_pet_window_registers_runtime_services_in_registry_order tests/unit/test_mcp_runtime.py tests/unit/test_plugin_services.py tests/unit/test_memory_store_resources.py -q -p no:warnings
+```
 
-已保留的语义：prepare、播放完成回调、fallback timeout、Broken pipe 重启、临时 wav 清理、
-soft-fail 静默跳过、`detach_local_service` 保留进程、provider 退役热切换。后台只生成 wav，
-播放仍回 UI 线程。
+结果：`61 passed`。
 
-## 下一步：第 4/5 阶段
-按 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md` 继续把 ServiceResource（MCP / Plugin / Memory）
-等纳入资源管理器。
+```powershell
+./runtime/python.exe -m pytest tests/unit/test_bootstrap.py tests/unit/test_plugin_system.py tests/unit/test_plugin_advanced.py tests/unit/test_plugin_services.py tests/unit/test_mcp_runtime.py tests/unit/test_memory_store_resources.py -q -p no:warnings
+```
 
-## 工作方式（请遵守）
-- **分段提交 git**，每个提交保持测试绿（破坏某测试就在同一提交里改它）。
-- 用中文交流。
-- 工作树里两个未跟踪的 `docs/*CHANGELOG.md` 与本次无关，别动。
-- 测试：`./runtime/python.exe -m pytest`；tests/ui 退出阶段约 1/3 概率的 native access
-  violation 是早于本阶段就存在的 daemon 线程/Qt 析构竞态，重跑即可，关注非崩溃运行是否全绿。
+结果：`76 passed`。
+
+```powershell
+./runtime/python.exe -m pytest tests/ui/test_pet_window.py::test_pet_window_locks_controls_during_startup_initialization tests/ui/test_pet_window.py::test_pet_window_unlocks_after_deferred_services_are_applied -q -p no:warnings
+```
+
+结果：`2 passed`。
+
+```powershell
+./runtime/python.exe -m pytest tests/integration/test_native_tool_calls.py::test_plugin_manager_loads_playwright_browser_plugin tests/integration/test_agent_core.py::test_playwright_plugin_registers_native_browser_tools -q -p no:warnings
+```
+
+结果：`2 passed`。
+
+说明：部分 pytest 运行结束后，Windows 临时目录 `pytest-current` 清理会打印 `PermissionError: [WinError 5]`
+的 atexit 提示，但进程退出码为 0，测试本身已通过。
+
+## 已知环境问题
+- `tests/ui/test_history_window.py` 需要 `qtbot`（runtime 未装 pytest-qt）。
+- `test_public_api_cleanup.py::test_legacy_sdk_package_is_removed` 可能受工作树未跟踪 `sdk/` 残留影响。
+- 若 tests/ui 退出阶段遇到 native access violation，先按既有文档重跑并对照
+  `docs/TTS_SHUTDOWN_NATIVE_CRASH.md` 判断是否为既有环境性问题。
+
+## 后续建议
+- 若要继续演进，可把更多插件后台资源迁到 `context.services.resources`，但不要破坏旧插件 `shutdown()` 兼容。
+- 若要做 release，请先跑更大范围回归，并确认未跟踪 changelog / 临时文件是否属于本次发布范围。

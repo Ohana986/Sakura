@@ -933,10 +933,10 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     )
     window._emit_app_closed_event = lambda: None
     window._stop_speaking_state_watchdog = lambda: None
-    window.close_tts_tools = lambda: None
-    window.close_mcp_tools = lambda: None
-    window.close_plugins = lambda: None
-    window._close_renderer_manager = lambda: None
+    window.close_tts_tools = lambda: order.append("tts_close")
+    window.close_mcp_tools = lambda: order.append("mcp_close")
+    window.close_plugins = lambda: order.append("plugins_close")
+    window._close_renderer_manager = lambda: order.append("renderer_close")
 
     window.close_external_tools()
 
@@ -949,6 +949,42 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     assert window.messages == []
     assert subtitle.cancelled is True
     assert order == ["backchannel_cancel", "stop_all"]
+
+
+def test_pet_window_registers_runtime_services_in_registry_order() -> None:
+    from app.core.resource_manager import ResourceManager, ResourceRegistry
+    from app.ui.pet_window import PetWindow
+
+    order: list[str] = []
+
+    class MemoryStoreStub:
+        def close(self) -> None:
+            order.append("memory")
+
+    class MinimalWindow:
+        _register_runtime_service_resources = PetWindow._register_runtime_service_resources
+
+        def close_tts_tools(self) -> None:
+            order.append("tts")
+
+        def close_mcp_tools(self) -> None:
+            order.append("mcp")
+
+        def _close_renderer_manager(self) -> None:
+            order.append("renderer")
+
+        def close_plugins(self) -> None:
+            order.append("plugins")
+
+    registry = ResourceRegistry()
+    window = MinimalWindow()
+    window.memory_store = MemoryStoreStub()
+    window.resource_manager = ResourceManager(registry=registry)
+
+    window._register_runtime_service_resources()
+    registry.stop_all()
+
+    assert order == ["memory", "tts", "mcp", "renderer", "plugins"]
 
 
 def test_shutdown_ignores_late_progress_and_reply() -> None:

@@ -1,21 +1,22 @@
 """运行时资源管理器（ResourceManager）。
 
-对应 issue #94 第 1+2 阶段：把原本散落在 ``PetWindow`` 里逐字重复的
-「创建 QThread → moveToThread → 接线 → quit → cleanup → 关闭」样板，以及
-lingering 线程与 Shiboken wrapper 保留这两个 native 安全机制，集中到一个
-活在 UI 主线程的 ``ResourceManager``（``QObject``）里。
+对应 issue #94：把原本散落在 ``PetWindow`` 里的 QThread worker、裸
+Python 线程、子进程、asyncio loop 与服务关闭链路，集中到 App 级
+``ResourceRegistry`` 与 UI 主线程上的 ``ResourceManager``（``QObject`` wrapper）。
 
-设计与路线图见 ``docs/RUNTIME_RESOURCE_MANAGER_PLAN.md``。本模块只实现
-QThread worker 生命周期所需的最小子集；Service/Process/async-loop 类资源
-留待后续阶段。
+设计与路线图见 ``docs/RUNTIME_RESOURCE_MANAGER_PLAN.md``。本模块同时保留
+lingering 线程与 Shiboken wrapper 保留这两个 native 安全机制。
 """
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -62,6 +63,28 @@ class StoppableResource(Protocol):
 
     def stop(self, timeout_ms: int = ...) -> bool:
         """请求停止；返回是否在 ``timeout_ms`` 内干净停止。"""
+
+
+@runtime_checkable
+class ManagedResource(StoppableResource, Protocol):
+    """受管资源的完整运行时契约。
+
+    第五阶段用于服务、asyncio loop、Python thread、进程等非 Qt 资源；现有
+    ``QtWorkerResource`` 只需满足 ``stop`` 最小契约即可继续被 registry 管理。
+    """
+
+    def is_running(self) -> bool:
+        """资源是否仍处于运行态。"""
+
+    def health(self) -> ResourceState:
+        """返回资源健康状态。"""
+
+
+@dataclass
+class _ResourceEntry:
+    resource: StoppableResource
+    label: str
+    shutdown_order: int
 
 
 @runtime_checkable
@@ -541,18 +564,391 @@ class ProcessResource:
         return True
 
 
+class ServiceResource:
+    """把已有服务对象的关闭函数纳入统一资源域。"""
+
+    def __init__(
+        self,
+        manager: "ResourceRegistry | ResourceManager",
+        *,
+        stop: Callable[[], Any] | None = None,
+        stop_with_timeout: Callable[[int], Any] | None = None,
+        is_running: Callable[[], bool] | None = None,
+        health: Callable[[], ResourceState] | None = None,
+        label: str = "",
+    ) -> None:
+        self._manager = manager
+        self._stop = stop
+        self._stop_with_timeout = stop_with_timeout
+        self._is_running = is_running
+        self._health = health
+        self.label = label
+        self.state = ResourceState.READY
+
+    def is_running(self) -> bool:
+        if self.state in (ResourceState.STOPPED, ResourceState.FAILED):
+            return False
+        if self._is_running is None:
+            return self.state not in (ResourceState.STOPPING, ResourceState.STOPPED)
+        try:
+            return bool(self._is_running())
+        except Exception as exc:  # noqa: BLE001
+            debug_log("ResourceManager", "服务运行态查询失败", {"service": self.label, "error": str(exc)})
+            return False
+
+    def health(self) -> ResourceState:
+        if self._health is not None:
+            try:
+                return self._health()
+            except Exception as exc:  # noqa: BLE001
+                debug_log("ResourceManager", "服务健康检查失败", {"service": self.label, "error": str(exc)})
+                return ResourceState.DEGRADED
+        if self.state in (ResourceState.STOPPING, ResourceState.STOPPED, ResourceState.FAILED):
+            return self.state
+        return ResourceState.READY if self.is_running() else ResourceState.STOPPED
+
+    def stop(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> bool:
+        if self.state in (ResourceState.STOPPING, ResourceState.STOPPED):
+            return True
+        self.state = ResourceState.STOPPING
+        clean = True
+        try:
+            if self._stop_with_timeout is not None:
+                result = self._stop_with_timeout(timeout_ms)
+            elif self._stop is not None:
+                result = self._stop()
+            else:
+                result = None
+            if isinstance(result, bool):
+                clean = result
+        except Exception as exc:  # noqa: BLE001
+            clean = False
+            self.state = ResourceState.FAILED
+            debug_log("ResourceManager", "服务关闭失败", {"service": self.label, "error": str(exc)})
+        else:
+            self.state = ResourceState.STOPPED if clean else ResourceState.DEGRADED
+        finally:
+            self._manager._unregister(self)
+        return clean
+
+    def detach(self) -> None:
+        """仅从 registry 移除，不触发关闭；用于宿主手动完成退役后的同步。"""
+        self.state = ResourceState.STOPPED
+        self._manager._unregister(self)
+
+
+class AsyncLoopResource:
+    """托管独立 asyncio event loop 及其 daemon 线程。"""
+
+    def __init__(
+        self,
+        manager: "ResourceRegistry | ResourceManager",
+        *,
+        loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
+        label: str = "",
+    ) -> None:
+        self._manager = manager
+        self._loop_factory = loop_factory or asyncio.new_event_loop
+        self.label = label
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._thread_name = label or "async-loop"
+        self._daemon = True
+        self.state = ResourceState.NEW
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        with self._lock:
+            return self._loop
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        with self._lock:
+            return self._thread
+
+    def start(
+        self,
+        *,
+        name: str | None = None,
+        daemon: bool = True,
+        ready_timeout_s: float = 5.0,
+    ) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive() and self._loop is not None:
+                return self._loop
+            self._thread_name = name or self._thread_name
+            self._daemon = daemon
+            self._ready.clear()
+            self.state = ResourceState.STARTING
+            thread = threading.Thread(target=self._run_loop, name=self._thread_name, daemon=daemon)
+            self._thread = thread
+            thread.start()
+        if not self._ready.wait(timeout=ready_timeout_s):
+            self.state = ResourceState.FAILED
+            raise TimeoutError(f"asyncio 事件循环启动超时：{self.label or self._thread_name}")
+        loop = self.loop
+        if loop is None:
+            self.state = ResourceState.FAILED
+            raise RuntimeError(f"asyncio 事件循环启动失败：{self.label or self._thread_name}")
+        self.state = ResourceState.READY
+        return loop
+
+    def submit(self, coro: Any, *, timeout: float) -> Any:
+        loop = self.loop
+        if loop is None or self.state in (ResourceState.STOPPING, ResourceState.STOPPED):
+            raise RuntimeError("asyncio 事件循环尚未运行。")
+        future: Future[Any] = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=timeout)
+
+    def is_running(self) -> bool:
+        thread = self.thread
+        return bool(thread is not None and thread.is_alive())
+
+    def health(self) -> ResourceState:
+        if self.state in (ResourceState.STOPPING, ResourceState.STOPPED, ResourceState.FAILED):
+            return self.state
+        loop = self.loop
+        return ResourceState.READY if self.is_running() and loop is not None and not loop.is_closed() else ResourceState.STOPPED
+
+    def restart(self, *, reason: str = "") -> bool:
+        if reason:
+            debug_log("ResourceManager", "重启 asyncio 事件循环", {"loop": self.label, "reason": reason})
+        self.stop(DEFAULT_THREAD_SHUTDOWN_WAIT_MS)
+        self._manager._register(self, label=self.label, shutdown_order=900)
+        self.start(name=self._thread_name, daemon=self._daemon)
+        return self.is_running()
+
+    def stop(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> bool:
+        with self._lock:
+            if self.state is ResourceState.STOPPED:
+                return True
+            self.state = ResourceState.STOPPING
+            loop = self._loop
+            thread = self._thread
+        if loop is None or thread is None:
+            self._finalize_stop()
+            return True
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            self._finalize_stop()
+            return True
+        if thread is threading.current_thread():
+            self._manager._keep_lingering_thread(thread, self.label or thread.name)
+            self._manager._unregister(self)
+            return False
+        thread.join(timeout_ms / 1000)
+        if thread.is_alive():
+            self._manager._keep_lingering_thread(thread, self.label or thread.name)
+            self._manager._unregister(self)
+            debug_log(
+                "ResourceManager",
+                "asyncio 事件循环线程未在退出等待时间内结束",
+                {"loop": self.label, "wait_ms": timeout_ms},
+            )
+            return False
+        self._finalize_stop()
+        return True
+
+    def _run_loop(self) -> None:
+        loop = self._loop_factory()
+        with self._lock:
+            self._loop = loop
+        asyncio.set_event_loop(loop)
+        self._ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+            with self._lock:
+                self._loop = None
+            if self.state is not ResourceState.STOPPING:
+                self._finalize_stop()
+
+    def _finalize_stop(self) -> None:
+        with self._lock:
+            self._thread = None
+            self._loop = None
+            self.state = ResourceState.STOPPED
+        self._manager._unregister(self)
+
+
+class ResourceRegistry:
+    """纯 Python、线程安全的 App 级资源注册表。"""
+
+    def __init__(self) -> None:
+        self._entries: list[_ResourceEntry] = []
+        self._lock = threading.RLock()
+        self._lingering_threads: list[threading.Thread] = []
+
+    @property
+    def _resources(self) -> list[StoppableResource]:
+        with self._lock:
+            return [entry.resource for entry in self._entries]
+
+    def stop_all(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> None:
+        with self._lock:
+            entries = tuple(sorted(self._entries, key=lambda entry: entry.shutdown_order, reverse=True))
+        for entry in entries:
+            try:
+                entry.resource.stop(timeout_ms)
+            except Exception as exc:  # noqa: BLE001
+                debug_log(
+                    "ResourceManager",
+                    "受管资源关闭异常",
+                    {"resource": entry.label, "error": str(exc)},
+                )
+            finally:
+                self._unregister(entry.resource)
+
+    def track_service(
+        self,
+        *,
+        stop: Callable[[], Any] | None = None,
+        stop_with_timeout: Callable[[int], Any] | None = None,
+        is_running: Callable[[], bool] | None = None,
+        health: Callable[[], ResourceState] | None = None,
+        label: str = "",
+        shutdown_order: int = 0,
+        register: bool = True,
+    ) -> ServiceResource:
+        resource = ServiceResource(
+            self,
+            stop=stop,
+            stop_with_timeout=stop_with_timeout,
+            is_running=is_running,
+            health=health,
+            label=label,
+        )
+        if register:
+            self._register(resource, label=label, shutdown_order=shutdown_order)
+        return resource
+
+    def track_async_loop(
+        self,
+        *,
+        loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
+        label: str = "",
+        shutdown_order: int = 900,
+        register: bool = True,
+    ) -> AsyncLoopResource:
+        resource = AsyncLoopResource(self, loop_factory=loop_factory, label=label)
+        if register:
+            self._register(resource, label=label, shutdown_order=shutdown_order)
+        return resource
+
+    def track_python_thread(
+        self,
+        *,
+        cancel: Callable[[], None] | None = None,
+        label: str = "",
+        shutdown_order: int = 1000,
+        register: bool = True,
+    ) -> ThreadResource:
+        resource = ThreadResource(self, cancel=cancel, label=label)
+        if register:
+            self._register(resource, label=label, shutdown_order=shutdown_order)
+        return resource
+
+    def track_thread_group(
+        self,
+        *,
+        cancel: Callable[[], None] | None = None,
+        label: str = "",
+        shutdown_order: int = 1000,
+        register: bool = True,
+    ) -> ThreadGroupResource:
+        resource = ThreadGroupResource(self, cancel=cancel, label=label)
+        if register:
+            self._register(resource, label=label, shutdown_order=shutdown_order)
+        return resource
+
+    def adopt_process(
+        self,
+        process: ProcessHandle | None = None,
+        *,
+        terminator: Callable[[ProcessHandle, int], None] | None = None,
+        restart_factory: Callable[[], ProcessHandle | None] | None = None,
+        terminate_timeout_s: int = DEFAULT_PROCESS_TERMINATE_TIMEOUT_S,
+        label: str = "",
+        shutdown_order: int = 800,
+        register: bool = True,
+    ) -> ProcessResource:
+        resource = ProcessResource(
+            self,
+            process,
+            terminator=terminator,
+            restart_factory=restart_factory,
+            terminate_timeout_s=terminate_timeout_s,
+            label=label,
+        )
+        if register:
+            self._register(resource, label=label, shutdown_order=shutdown_order)
+        return resource
+
+    def _register(
+        self,
+        resource: StoppableResource,
+        *,
+        label: str = "",
+        shutdown_order: int = 0,
+    ) -> None:
+        with self._lock:
+            for entry in self._entries:
+                if entry.resource is resource:
+                    entry.label = label or entry.label
+                    entry.shutdown_order = shutdown_order
+                    return
+            self._entries.append(_ResourceEntry(resource, label, shutdown_order))
+
+    def _unregister(self, resource: StoppableResource) -> None:
+        with self._lock:
+            self._entries = [entry for entry in self._entries if entry.resource is not resource]
+
+    def _keep_lingering_thread(self, thread: threading.Thread, label: str) -> None:
+        with self._lock:
+            if thread in self._lingering_threads:
+                return
+            self._lingering_threads.append(thread)
+        debug_log("ResourceManager", "登记 lingering Python 线程", {"thread": label})
+
+
 class ResourceManager(QObject):
     """集中托管 QThread worker 生命周期、lingering 线程与退役 wrapper。
 
     活在 UI 主线程，通常作为 ``PetWindow`` 的子对象创建。
     """
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        registry: ResourceRegistry | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._resources: list[StoppableResource] = []
+        self._registry = registry if registry is not None else ResourceRegistry()
         self._lingering: list[tuple[QThread, QObject | None]] = []
-        self._lingering_threads: list[threading.Thread] = []
         self._retired_wrappers: list[QObject] = []
+
+    @property
+    def registry(self) -> ResourceRegistry:
+        """当前窗口/协调器共享的 App 级资源域。"""
+        return self._registry
+
+    @property
+    def _resources(self) -> list[StoppableResource]:
+        return self._registry._resources
+
+    @property
+    def _lingering_threads(self) -> list[threading.Thread]:
+        return self._registry._lingering_threads
 
     # ---- Phase 2：worker 工厂与批量关闭 ----------------------------------
 
@@ -608,7 +1004,7 @@ class ResourceManager(QObject):
         setattr(owner, thread_attr, thread)
         setattr(owner, worker_attr, worker)
         if register:
-            self._register(resource)
+            self._register(resource, label=label or thread_attr, shutdown_order=1000)
         thread.start()
         return resource
 
@@ -626,7 +1022,7 @@ class ResourceManager(QObject):
         """
         resource = ThreadResource(self, cancel=cancel, label=label)
         if register:
-            self._register(resource)
+            self._register(resource, label=label, shutdown_order=1000)
         return resource
 
     def track_thread_group(
@@ -639,7 +1035,7 @@ class ResourceManager(QObject):
         """创建可并发托管多个裸 Python 线程的资源。"""
         resource = ThreadGroupResource(self, cancel=cancel, label=label)
         if register:
-            self._register(resource)
+            self._register(resource, label=label, shutdown_order=1000)
         return resource
 
     def adopt_process(
@@ -662,22 +1058,60 @@ class ResourceManager(QObject):
             label=label,
         )
         if register:
-            self._register(resource)
+            self._register(resource, label=label, shutdown_order=800)
         return resource
 
-    def stop_all(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> None:
-        """停止所有受管资源。资源之间相互独立，关闭顺序不影响正确性。"""
-        for resource in tuple(self._resources):
-            resource.stop(timeout_ms)
+    def track_service(
+        self,
+        *,
+        stop: Callable[[], Any] | None = None,
+        stop_with_timeout: Callable[[int], Any] | None = None,
+        is_running: Callable[[], bool] | None = None,
+        health: Callable[[], ResourceState] | None = None,
+        label: str = "",
+        shutdown_order: int = 0,
+        register: bool = True,
+    ) -> ServiceResource:
+        return self._registry.track_service(
+            stop=stop,
+            stop_with_timeout=stop_with_timeout,
+            is_running=is_running,
+            health=health,
+            label=label,
+            shutdown_order=shutdown_order,
+            register=register,
+        )
 
-    def _register(self, resource: StoppableResource) -> None:
-        self._resources.append(resource)
+    def track_async_loop(
+        self,
+        *,
+        loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
+        label: str = "",
+        shutdown_order: int = 900,
+        register: bool = True,
+    ) -> AsyncLoopResource:
+        return self._registry.track_async_loop(
+            loop_factory=loop_factory,
+            label=label,
+            shutdown_order=shutdown_order,
+            register=register,
+        )
+
+    def stop_all(self, timeout_ms: int = DEFAULT_THREAD_SHUTDOWN_WAIT_MS) -> None:
+        """停止所有受管资源；按 shutdown_order 从高到低执行。"""
+        self._registry.stop_all(timeout_ms)
+
+    def _register(
+        self,
+        resource: StoppableResource,
+        *,
+        label: str = "",
+        shutdown_order: int = 1000,
+    ) -> None:
+        self._registry._register(resource, label=label, shutdown_order=shutdown_order)
 
     def _unregister(self, resource: StoppableResource) -> None:
-        try:
-            self._resources.remove(resource)
-        except ValueError:
-            pass
+        self._registry._unregister(resource)
 
     # ---- Phase 1：关闭机制、lingering 线程、wrapper 保留 -----------------
 
@@ -744,15 +1178,8 @@ class ResourceManager(QObject):
             self._release_lingering(thread)
 
     def _keep_lingering_thread(self, thread: threading.Thread, label: str) -> None:
-        """登记一个 join 超时的裸 Python 线程。
-
-        Python 无法安全强杀线程；合成线程都是 daemon，会随进程退出而结束。这里仅
-        留引用与日志便于排查，不做 deleteLater（裸线程无 Qt wrapper）。
-        """
-        if thread in self._lingering_threads:
-            return
-        self._lingering_threads.append(thread)
-        debug_log("ResourceManager", "登记 lingering Python 线程", {"thread": label})
+        """登记一个 join 超时的裸 Python 线程。"""
+        self._registry._keep_lingering_thread(thread, label)
 
     def _release_lingering(self, thread: QThread) -> None:
         remaining: list[tuple[QThread, QObject | None]] = []

@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+from app.core.resource_manager import (
+    DEFAULT_THREAD_SHUTDOWN_WAIT_MS,
+    ResourceRegistry,
+    ThreadGroupResource,
+)
 from app.storage.atomic import rename_with_retry
 from app.storage.chat_history import ChatHistoryEntry
 from app.storage.paths import StoragePaths
@@ -107,6 +112,7 @@ class MemoryStore:
     api_settings: "ApiSettings | None" = None
     scope_id: str = DEFAULT_MEMORY_SCOPE
     memory_client: Any | None = None
+    resource_registry: ResourceRegistry | None = None
     _memory: Any | None = field(default=None, init=False, repr=False)
     _loading: bool = field(default=False, init=False, repr=False)
     _loading_started_at: float = field(default=0.0, init=False, repr=False)
@@ -121,11 +127,18 @@ class MemoryStore:
         init=False,
         repr=False,
     )
+    _closed: bool = field(default=False, init=False, repr=False)
+    _thread_group: ThreadGroupResource = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.base_dir = _resolve_base_dir(self.base_dir)
         self.scope_id = _normalize_scope_id(self.scope_id)
+        self.resource_registry = self.resource_registry or ResourceRegistry()
+        self._thread_group = self.resource_registry.track_thread_group(
+            label="memory_store",
+            shutdown_order=1000,
+        )
         if self.memory_client is not None:
             self._memory = self.memory_client
             self._status = "ready"
@@ -185,6 +198,26 @@ class MemoryStore:
                 self._status_message = ""
         _close_memory_client(old_memory)
 
+    def close(self) -> None:
+        """关闭长期记忆运行时并阻止迟到的后台加载结果重新写回。"""
+        old_memory: Any | None = None
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._reload_generation += 1
+            old_memory = self._memory
+            self._memory = None
+            self._loading = False
+            self._loading_started_at = 0.0
+            self._load_error = ""
+            self._reloading = False
+            self._reload_error = ""
+            self._status = "stopped"
+            self._status_message = "长期记忆系统已关闭。"
+        self._thread_group.stop(DEFAULT_THREAD_SHUTDOWN_WAIT_MS)
+        _close_memory_client(old_memory)
+
     def is_ready(self) -> bool:
         """返回长期记忆运行时是否已经可直接使用。"""
 
@@ -226,7 +259,7 @@ class MemoryStore:
             self._get_memory(wait=True)
             return
         with self._lock:
-            if self._memory is not None or self._loading:
+            if self._closed or self._memory is not None or self._loading:
                 return
             if self._load_error:
                 self._load_error = ""
@@ -237,6 +270,8 @@ class MemoryStore:
         """后台使用新 API 配置重建 mem0，成功前保留旧实例继续服务。"""
 
         with self._lock:
+            if self._closed:
+                return
             if self.api_settings == api_settings and self._memory is not None and not self._reload_error:
                 return
             self.api_settings = api_settings
@@ -313,11 +348,19 @@ class MemoryStore:
                     self._publish_status("failed", f"长期记忆系统重载失败：{exc}")
                 return
             applied = False
+            should_apply = False
+            stale_memory: Any | None = None
             with self._lock:
-                if generation != self._reload_generation:
-                    return
-                if reload_llm_only and self._memory is not existing_memory:
-                    return
+                if generation == self._reload_generation and not (
+                    reload_llm_only and self._memory is not existing_memory
+                ):
+                    should_apply = True
+                elif not reload_llm_only:
+                    stale_memory = memory
+            if not should_apply:
+                _close_memory_client(stale_memory)
+                return
+            with self._lock:
                 if reload_llm_only:
                     self._apply_memory_llm(memory, llm_config, llm)
                 else:
@@ -330,8 +373,14 @@ class MemoryStore:
             if applied:
                 self._publish_status("ready", "长期记忆系统已就绪。")
 
-        thread = threading.Thread(target=reload, name="sakura-mem0-reloader", daemon=True)
-        thread.start()
+        thread = self._thread_group.spawn(
+            reload,
+            name="sakura-mem0-reloader",
+            daemon=True,
+        )
+        if thread is None:
+            with self._lock:
+                self._reloading = False
 
     def build_mem0_config(self, api_settings: "ApiSettings | None" = None) -> dict[str, Any]:
         """生成 mem0 配置：本地 Qdrant + Sakura 当前 OpenAI-compatible LLM。"""
@@ -568,6 +617,10 @@ class MemoryStore:
 
     def _get_memory(self, *, wait: bool = True) -> Any | None:
         with self._lock:
+            if self._closed:
+                if wait:
+                    raise RuntimeError("长期记忆系统已关闭。")
+                return None
             if self._memory is not None:
                 return self._memory
             if self._load_error and not self._loading:
@@ -631,17 +684,28 @@ class MemoryStore:
                 if report_dependency_loading:
                     self._publish_status("failed", error_message)
                 return
+            stale_mem: Any | None = None
             with self._lock:
-                if generation != self._reload_generation or self.api_settings != api_settings:
+                if generation != self._reload_generation or self.api_settings != api_settings or self._closed:
                     self._loading = False
-                    return
-                self._memory = mem
+                    stale_mem = mem
+                else:
+                    self._memory = mem
+            if stale_mem is not None:
+                _close_memory_client(stale_mem)
+                return
+            with self._lock:
                 self._loading = False
             if report_dependency_loading:
                 self._publish_status("ready", "长期记忆系统已就绪。")
 
-        thread = threading.Thread(target=load, name="sakura-mem0-loader", daemon=True)
-        thread.start()
+        thread = self._thread_group.spawn(
+            load,
+            name="sakura-mem0-loader",
+            daemon=True,
+        )
+        if thread is None:
+            self._loading = False
         return status_event
 
     def _create_memory_client(self, api_settings: "ApiSettings | None" = None) -> Any:

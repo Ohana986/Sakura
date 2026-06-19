@@ -1,8 +1,8 @@
 # 运行时资源管理器（ResourceManager）设计与路线图
 
 > 对应 issue #94。本文定义 Sakura 后端资源管理层的目标架构、资源状态机、线程域与关闭顺序，
-> 并记录分阶段落地范围。**当前分支只落地第 1+2 阶段**（QThread worker 生命周期托管），
-> 其余阶段为待实现的契约。
+> 并记录分阶段落地范围。**当前分支已落地第 1-5 阶段核心实现**：QThread、Python thread/group、
+> process、async loop、service resource 与 App 级 ResourceRegistry 均已纳入统一关闭域。
 
 ## 背景：三套生命周期模型
 
@@ -38,13 +38,14 @@ UI、生命周期管理器、服务注入器、线程持有者与关闭协调器
 
 ```mermaid
 flowchart TD
-    A["QApplication / UI 主线程"] --> B["ResourceManager (QObject)"]
-    B --> C["资源注册表"]
+    A["QApplication / UI 主线程"] --> B["ResourceManager (QObject wrapper)"]
+    B --> C["ResourceRegistry (App 级共享资源域)"]
     C --> E["QtWorkerResource: QThread + QObject worker"]
-    C --> F["ThreadResource: Python thread / executor（第 3 阶段：TTS 合成线程）"]
-    C --> G["ProcessResource: 本地 TTS 子进程（第 3 阶段：GPT-SoVITS/Genie）"]
-    C --> H["ServiceResource: TTS / MCP / Plugin / Memory（规划中）"]
-    E --> I["PetWindow UI 更新（signal/queued 回主线程）"]
+    C --> F["ThreadResource / ThreadGroupResource: Python thread"]
+    C --> G["ProcessResource: 本地 TTS 子进程"]
+    C --> H["AsyncLoopResource: MCP asyncio loop"]
+    C --> I["ServiceResource: TTS / MCP / Plugin / Memory / Renderer"]
+    E --> J["PetWindow UI 更新（signal/queued 回主线程）"]
 ```
 
 ## 资源状态机
@@ -83,7 +84,7 @@ NEW → STARTING → READY → STOPPING → STOPPED
 
 ## ManagedResource 契约
 
-后续阶段的 Service/Process 资源统一实现：
+第五阶段后，非 Qt 资源统一实现或适配到以下最小契约：
 
 ```text
 start()              启动
@@ -94,19 +95,23 @@ close()              释放
 state_changed        状态变更信号
 ```
 
-第 1+2 阶段的 `QtWorkerResource` 只实现该契约中 worker 生命周期所需的最小子集
-（`stop` / `is_running` / 内部 cleanup）；`restart` / `health` / `state_changed` 留待 Service 资源。
+`QtWorkerResource` 保持 Qt worker 生命周期所需的最小子集；`ThreadResource`、`ThreadGroupResource`、
+`ProcessResource`、`ServiceResource`、`AsyncLoopResource` 已提供 `stop` / `is_running` / `health`
+等统一投影，其中 `AsyncLoopResource` 与 `ProcessResource` 提供 `restart()`。
 
 ## 关闭顺序
 
 `PetWindow.close_external_tools()` 触发的关闭顺序（保持现状语义）：
 
 1. 发出 app-closed 事件、停 speaking watchdog、取消字幕流。
-2. 接话控制器 `shutdown(timeout)`（join 后台分类线程，超时则后台自然完成）。
-3. **`ResourceManager.stop_all(timeout)`**：对每个受管 QThread worker 执行
-   `cancel() → requestInterruption() → quit() → wait(timeout)`；超时未结束则转入 *lingering*
-   （保留 Python wrapper + 连接 `finished → deleteLater`），不阻塞 UI 退出。
-4. 关闭 TTS / MCP / 插件 / renderer。
+2. 取消 UI 在飞流程：字幕流、接话控制器等只做即时止血，不再各自手写 join 链路。
+3. **`ResourceManager.stop_all(timeout)`**：委托 shared `ResourceRegistry` 按 `shutdown_order` 关闭
+   Qt worker、Python thread/group、process、async loop 与 service resource。QThread 超时转入 *lingering*
+   （保留 Python wrapper + 连接 `finished → deleteLater`），裸 Python 线程超时登记到 lingering 线程列表，
+   不阻塞 UI 退出。
+
+当前 App 级服务关闭顺序由注册顺序表达：MemoryStore 先失效 generation，随后 TTS / MCP / renderer /
+PluginManager；插件自登记资源经 `PluginServices.resources` 进入同一 registry。
 
 ### lingering 与 wrapper 保留
 
@@ -122,23 +127,33 @@ state_changed        状态变更信号
 
 | 阶段 | 范围 | 风险 | 收益 | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | ResourceManager 基础设施 + 迁出生命周期工具 | 低 | 生命周期集中 | ✅ 本分支 |
-| 2 | 托管 6 个现有 QThread worker | 中低 | 直接降低 Qt 退出/测试崩溃 | ✅ 本分支 |
-| 3 | 拆分 TTS Provider（服务进程 / 合成队列 / 播放端点） | 中高 | 解决 TTS 重启/播放/进程混杂 | ⏳ 待定 |
-| 4 | 接话模块资源化 | 中 | 分类线程关闭更可靠 | ⏳ 待定 |
-| 5 | memory / MCP / plugin 统一治理 | 中高 | native/thread 资源统一 | ⏳ 待定 |
+| 1 | ResourceManager 基础设施 + 迁出生命周期工具 | 低 | 生命周期集中 | ✅ 已完成 |
+| 2 | 托管现有 QThread worker | 中低 | 直接降低 Qt 退出/测试崩溃 | ✅ 已完成 |
+| 3 | 拆分 TTS Provider（服务进程 / 合成队列 / 播放端点） | 中高 | 解决 TTS 重启/播放/进程混杂 | ✅ 已完成 |
+| 4 | 接话模块资源化 | 中 | 分类线程关闭更可靠 | ✅ 已完成 |
+| 5 | App 级 ResourceRegistry：memory / MCP / plugin / renderer 统一治理 | 中高 | native/thread/service 资源统一 | ✅ 已完成 |
 
-### 第 1+2 阶段已落地内容
+### 第 1-5 阶段已落地内容
 
-- 新增 `app/core/resource_manager.py`：
+- `app/core/resource_manager.py`：
+  - `ResourceRegistry`——纯 Python、线程安全的 App 级共享资源注册表。
   - `QtWorkerResource`——托管一对 `QThread + QObject worker` 的完整生命周期。
-  - `ResourceManager`（`QObject`，活在 UI 主线程）——`spawn_qt_worker()` 工厂、`stop_all()`、
-    集中的 lingering 列表与 wrapper 保留/prune。
+  - `ThreadResource` / `ThreadGroupResource`——托管裸 Python 线程与并发线程组。
+  - `ProcessResource`——托管本地子进程。
+  - `ServiceResource`——把已有服务对象的关闭函数适配到统一资源域。
+  - `AsyncLoopResource`——托管 MCP 等独立 asyncio loop + daemon thread。
+  - `ResourceManager`（`QObject`，活在 UI 主线程）——Qt wrapper 能力 + shared registry wrapper。
 - `PetWindow` 的 `_shutdown_qthread` / `_keep/_release_shutdown_lingering_thread` /
   `_retain/_prune_qobject_wrappers` 迁出到 ResourceManager；窗口改为委托调用。
-- 6 个 worker 创建点（`ChatWorker`、`EventWorker`、`MemoryCurationWorker`、
-  `DeferredStartupWorker`、`TTSReadyWarmupWorker`、`ScreenObservationEncodeWorker`）改用
-  `spawn_qt_worker()`，行为与现状逐字等价。
+- QThread worker 创建点改用 `spawn_qt_worker()`，行为与现状逐字等价。
+- TTS provider 拆成服务进程、合成队列、播放端点，进程与合成线程由资源层托管。
+- Backchannel 分类线程改由 `ThreadGroupResource` 托管，`PetWindow.close_external_tools()` 只保留 cancel。
+- `AppContext` 创建 shared `ResourceRegistry`，并传给 MemoryStore、PluginManager、MCP provider 等延迟服务。
+- MCP bridge 使用 `AsyncLoopResource` 管理 loop/thread；provider 自身注册为 `ServiceResource`。
+- MemoryStore 使用 `ThreadGroupResource` 托管 preload/reload，并提供 `close()` 失效迟到结果与关闭 runtime。
+- PluginManager 使用 shared registry；`PluginServices.resources` 允许插件登记 cleanup/thread/executor，
+  内置 Playwright 浏览器插件已改走资源门面。
+- PetWindow 主关闭链路收敛为：发事件、取消 UI 流、`resource_manager.stop_all()`。
 
 > 设计取向：第一版保持克制。`PetWindow` 仍持有 `self.worker` 等属性（指向 manager 创建的对象），
 > 让现有处理器与既有测试断言无需改写；manager 只接管「样板接线 + 关闭 + wrapper 治理」。

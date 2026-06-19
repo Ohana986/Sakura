@@ -5,9 +5,26 @@
 > 配合阅读 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md`（设计/状态机/线程域）与
 > `docs/RESOURCE_MANAGER_HANDOFF.md`（总交接）。
 
+## 完成记录（2026-06-20）
+
+第 4/5 阶段已按“彻底版 App 级资源域收口”实现：
+
+- 第 4 阶段：Backchannel 分类线程改由 `ThreadGroupResource` 托管；PetWindow 关闭时只做 cancel，
+  等待/lingering 统一交给 `resource_manager.stop_all()`。
+- 第 5 阶段：新增纯 Python、线程安全的 `ResourceRegistry`；`ResourceManager(QObject)` 持有 shared registry。
+- `AppContext.resource_registry` 由 bootstrap 创建，并传入 MemoryStore、PluginManager、MCP provider 等服务。
+- MCP bridge 使用 `AsyncLoopResource`；`MCPToolProvider` 自身注册为 `ServiceResource`。
+- MemoryStore loader/reloader 使用 `ThreadGroupResource`，新增 `close()` 失效 generation、停止线程、关闭 runtime。
+- PluginManager 接入 shared registry，`PluginServices.resources` 提供 cleanup/thread/executor 登记入口；
+  内置 `playwright_browser` 已通过资源门面登记浏览器清理。
+- `PetWindow.close_external_tools()` 主链路收敛为：发关闭事件、取消 UI 流、`resource_manager.stop_all()`；
+  不再手写串联 TTS / MCP / plugin / renderer close。
+
+验证见 `docs/RESOURCE_MANAGER_HANDOFF.md`。
+
 ## 0. 项目与分支
 - 仓库根目录：`C:\Users\LBW\MyFile\sakura-project\Sakura`（PySide6/Qt 桌宠，Windows）
-- 当前分支：`refactor/resource-manager`（从 `origin/dev` 切出），第 1+2+3 阶段已完成，**未推送**。
+- 当前分支：`refactor/resource-manager`（从 `origin/dev` 切出），第 1-5 阶段核心改造已完成。
 - 测试：`./runtime/python.exe -m pytest`（**别用系统 Python**，Anaconda 的 PySide6 会崩 0xc0000139）。
 - 已知 3 个**环境性/计时性**问题，与重构无关：
   - `tests/ui/test_history_window.py`（runtime 没装 pytest-qt）。
@@ -164,5 +181,7 @@
 
 ---
 
-## 下一阶段（第 4 阶段）简短提示词
-见 `docs/RESOURCE_MANAGER_PHASE_4_PROMPT.md`（或直接复制本文件 §4 给新会话）。
+## 后续提示
+
+第 4/5 阶段已完成。本文件保留原计划作为实现依据；后续若继续演进，优先围绕
+`PluginServices.resources` 迁移更多插件自带后台资源，并保持旧插件 `shutdown()` 兼容。

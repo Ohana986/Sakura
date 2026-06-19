@@ -579,7 +579,8 @@ class PetWindow(QWidget):
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
         # 后台线程生命周期、lingering 线程与退役 wrapper 统一由资源管理器治理。
-        self.resource_manager = ResourceManager(self)
+        self.resource_manager = ResourceManager(self, registry=context.resource_registry)
+        self._register_runtime_service_resources()
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
@@ -1124,6 +1125,36 @@ class PetWindow(QWidget):
             self.renderer_manager = None
             self._set_portrait_overlay_suppressed(False)
 
+    def _register_runtime_service_resources(self) -> None:
+        """把 App 级长期服务登记到 shared ResourceRegistry。"""
+        close_memory = getattr(self.memory_store, "close", None)
+        if callable(close_memory):
+            self.resource_manager.track_service(
+                stop=close_memory,
+                label="memory_store",
+                shutdown_order=1200,
+            )
+        self.resource_manager.track_service(
+            stop=self.close_tts_tools,
+            label="tts_provider",
+            shutdown_order=900,
+        )
+        self.resource_manager.track_service(
+            stop=self.close_mcp_tools,
+            label="mcp_provider",
+            shutdown_order=800,
+        )
+        self.resource_manager.track_service(
+            stop=self._close_renderer_manager,
+            label="renderer_manager",
+            shutdown_order=750,
+        )
+        self.resource_manager.track_service(
+            stop=self.close_plugins,
+            label="plugin_manager",
+            shutdown_order=700,
+        )
+
     def _start_gaze_tracking(self) -> None:
         """overlay 渲染器激活时，周期采样鼠标位置驱动角色视线追踪。
 
@@ -1233,10 +1264,6 @@ class PetWindow(QWidget):
         if callable(cancel_backchannel):
             cancel_backchannel()
         self.resource_manager.stop_all(THREAD_SHUTDOWN_WAIT_MS)
-        self.close_tts_tools()
-        self.close_mcp_tools()
-        self.close_plugins()
-        self._close_renderer_manager()
 
     def _emit_app_started_event(self) -> None:
         """启动就绪后落盘 app.started；若存在上次关闭记录则附带跨会话信息并注入首条消息。"""
