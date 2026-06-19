@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover - 仅供无真实 PySide6 的最小测试桩环境
+    shiboken6 = None  # type: ignore[assignment]
+
 from app.core.debug_log import debug_log
 from app.voice import audio_checks as _audio_checks
 from app.voice.tts_settings import (
@@ -68,6 +73,7 @@ class TTSPlaybackEndpoint(QObject):
     _prepared_audio_ready = Signal(object, str)
     _prepared_audio_failed = Signal(object, str)
     _prepared_audio_skipped = Signal(object)
+    _cleanup_requested = Signal(object)
     _failed = Signal(str)
     _started = Signal(object)
     _finished = Signal(object)
@@ -84,6 +90,8 @@ class TTSPlaybackEndpoint(QObject):
         self._tts_cache_dir = cache_dir
         # _provider_is_closed(self) 经此回调读取协调器关闭状态
         self._is_closed = is_closed
+        # close() 第一阶段只改 Python 状态，后台线程从此不再触碰 Qt 信号。
+        self._accepting_results = True
         # 队列元素：(音频路径, 开始回调, 完成回调, 预生成句柄, 合成文本)
         self._pending_audio: list[
             tuple[Path, TTSCallback | None, TTSCallback | None, TTSPreparedAudio | None, str]
@@ -105,12 +113,18 @@ class TTSPlaybackEndpoint(QObject):
         self._prepared_audio_ready.connect(self._store_prepared_audio)
         self._prepared_audio_failed.connect(self._fail_prepared_audio)
         self._prepared_audio_skipped.connect(self._skip_prepared_audio)
+        self._cleanup_requested.connect(self._schedule_synthesis_cleanup)
         self._failed.connect(self._log_error)
         self._started.connect(self._run_callback)
         self._finished.connect(self._run_callback)
 
+    def begin_shutdown(self) -> None:
+        """封闭合成结果入口；本方法不调用 Qt API，可在等待后台线程前执行。"""
+        self._accepting_results = False
+
     def shutdown(self) -> None:
         """关闭时清空播放队列、收尾当前音频并释放播放器（不杀进程/线程）。"""
+        self.begin_shutdown()
         self._clear_pending_audio()
         if self._current_audio is not None:
             self._finish_current_audio("provider_closed")
@@ -170,7 +184,7 @@ class TTSPlaybackEndpoint(QObject):
         finally:
             self._playback_warmup_requested = False
 
-    @Slot(str, object, object)
+    @Slot(str, object, object, str)
     def _enqueue_audio(
         self,
         audio_path: str,
@@ -181,7 +195,7 @@ class TTSPlaybackEndpoint(QObject):
         if _provider_is_closed(self):
             path = Path(audio_path)
             debug_log("TTS", "Provider 已关闭，清理迟到音频", {"audio_path": path, "text": text})
-            self._schedule_audio_cleanup(path)
+            self._discard_late_audio(path)
             return
         self._pending_audio.append((Path(audio_path), on_started, on_finished, None, text))
         debug_log(
@@ -204,7 +218,7 @@ class TTSPlaybackEndpoint(QObject):
         if _provider_is_closed(self):
             handle.failed = True
             debug_log("TTS", "Provider 已关闭，清理迟到的预生成音频", {"audio_path": path})
-            self._schedule_audio_cleanup(path)
+            self._discard_late_audio(path)
             return
         if handle.cancelled:
             debug_log("TTS", "预生成音频已取消，清理文件", {"audio_path": path})
@@ -245,6 +259,8 @@ class TTSPlaybackEndpoint(QObject):
         与 _fail_prepared_audio 的唯一区别是不调用 _log_error，因此不会向 UI 报错。
         """
         handle.failed = True
+        if _provider_is_closed(self):
+            return
         if handle.cancelled or not handle.play_requested:
             return
         self._started.emit(handle.on_started)
@@ -311,12 +327,14 @@ class TTSPlaybackEndpoint(QObject):
 
     @Slot(str)
     def _log_error(self, message: str) -> None:
+        if _provider_is_closed(self):
+            return
         debug_log("TTS", "错误通知", {"message": message})
         self.error_occurred.emit(message)
 
     @Slot(object)
     def _run_callback(self, callback: TTSCallback | None) -> None:
-        if callback is None:
+        if callback is None or _provider_is_closed(self):
             return
         try:
             callback()
@@ -334,8 +352,10 @@ class TTSPlaybackEndpoint(QObject):
         self._started.emit(on_started)
         self._finished.emit(on_finished)
 
-    def _fail_audio_request(self, request: _TTSRequest, message: str) -> None:
-        if _provider_is_closed(self):
+    def fail_audio_request(self, request: _TTSRequest, message: str) -> None:
+        if not self._can_accept_synthesis_result():
+            if request.prepared_audio is not None:
+                request.prepared_audio.failed = True
             debug_log("TTS", "Provider 已关闭，忽略音频请求失败通知", {"message": message})
             return
         if request.prepared_audio is None:
@@ -343,12 +363,16 @@ class TTSPlaybackEndpoint(QObject):
             return
         self._prepared_audio_failed.emit(request.prepared_audio, message)
 
-    def _skip_audio_request(self, request: _TTSRequest, reason: str) -> None:
+    def skip_audio_request(self, request: _TTSRequest, reason: str) -> None:
         """本段无需/无法发音但不算故障：正常走完回调让流程推进，不向 UI 报错。
 
-        与 _fail_audio_request 相比，不 emit _failed/error_occurred，只记 debug；
+        与 fail_audio_request 相比，不 emit _failed/error_occurred，只记 debug；
         用于纯标点段（无可发音内容）与服务端单段 tts failed 的优雅降级。
         """
+        if not self._can_accept_synthesis_result():
+            if request.prepared_audio is not None:
+                request.prepared_audio.failed = True
+            return
         debug_log("TTS", "跳过本段合成", {"text": request.text, "reason": reason})
         if request.prepared_audio is None:
             self._started.emit(request.on_started)
@@ -698,6 +722,13 @@ class TTSPlaybackEndpoint(QObject):
         self._finish_current_audio("fallback_timeout")
         self._play_next()
 
+    @Slot(object)
+    def _schedule_synthesis_cleanup(self, audio_path: Path) -> None:
+        if _provider_is_closed(self):
+            self._discard_late_audio(Path(audio_path))
+            return
+        self._schedule_audio_cleanup(Path(audio_path))
+
     def _schedule_audio_cleanup(self, audio_path: Path, attempt: int = 1) -> None:
         debug_log("TTS", "计划清理临时音频", {"audio_path": audio_path, "attempt": attempt})
         QTimer.singleShot(
@@ -770,10 +801,45 @@ class TTSPlaybackEndpoint(QObject):
         on_finished: TTSCallback | None,
         text: str,
     ) -> None:
+        if not self._can_accept_synthesis_result():
+            self._discard_late_audio(Path(audio_path))
+            return
         self._audio_ready.emit(audio_path, on_started, on_finished, text)
 
     def deliver_prepared(self, handle: TTSPreparedAudio, audio_path: str) -> None:
+        if not self._can_accept_synthesis_result():
+            handle.failed = True
+            self._discard_late_audio(Path(audio_path))
+            return
         self._prepared_audio_ready.emit(handle, audio_path)
 
     def schedule_cleanup(self, audio_path: Path) -> None:
-        self._schedule_audio_cleanup(audio_path)
+        if not self._can_accept_synthesis_result():
+            self._discard_late_audio(audio_path)
+            return
+        self._cleanup_requested.emit(audio_path)
+
+    def _can_accept_synthesis_result(self) -> bool:
+        """后台线程投递前确认 Provider 与底层 C++ QObject 都仍然存活。"""
+        if not self._accepting_results or _provider_is_closed(self):
+            return False
+        if shiboken6 is None:
+            return True
+        try:
+            return bool(shiboken6.isValid(self))
+        except RuntimeError:
+            return False
+
+    @staticmethod
+    def _discard_late_audio(audio_path: Path) -> None:
+        """Qt 已关闭时同步清理未进入播放链路的临时音频。"""
+        try:
+            audio_path.unlink(missing_ok=True)
+            debug_log("TTS", "迟到音频已清理", {"audio_path": audio_path})
+        except OSError as exc:
+            # 无法再依赖 QTimer 重试；残留文件会由下次启动的缓存清理接管。
+            debug_log(
+                "TTS",
+                "迟到音频清理失败，留待下次启动处理",
+                {"audio_path": audio_path, "error": str(exc)},
+            )

@@ -1,68 +1,76 @@
-# 已知问题：pytest 退出阶段 native access violation（待修复）
+# TTS 退出竞态与 pytest Qt 清理 native crash（已修复）
 
-> 一个**本地 runtime 的计时性 native 崩溃**，与 issue #94 重构无关（重构前就存在）。
-> 记录于此供后续单独修复。不影响功能正确性：非崩溃运行下全部测试通过。
+> 修复日期：2026-06-20。
+> 本记录保留原始现象、归因修正和最终验证证据，供后续排查类似 PySide6 退出竞态。
 
-## 现象
-跑 `tests/ui`（或 `tests/unit tests/ui` 组合）时，**约 1/3 概率**在进程退出阶段报：
+## 原始现象
 
-```
+运行 `tests/ui`（或 `tests/unit tests/ui` 组合）时，Windows bundled runtime 曾随机崩溃：
+
+```text
 Windows fatal exception: access violation
-
-Current thread 0x........ (most recent call first):
-  <无 Python 帧，或停在 pytest 退出栈>
 ```
 
-特征：
-- **不伴随任何具体测试 FAIL**——崩溃发生在所有测试跑完、解释器退出阶段。
-- 非崩溃的那次运行**全绿**：`tests/ui` = 283 passed，`tests/unit + tests/ui` = 988 passed。
-- `-v`（verbose）模式有时能跑到打印 `283 passed` 再崩或不崩——纯计时性，非确定性。
+系统错误码为 `0xC0000005`（进程退出码 `-1073741819`）。崩溃可能发生在测试中主动调用 `processEvents()`、pytest teardown 或解释器退出阶段，不一定伴随断言失败。
 
-## 复现
-```bash
-cd C:/Users/LBW/MyFile/sakura-project/Sakura
-for i in 1 2 3; do
-  ./runtime/python.exe -m pytest tests/ui -q -p no:warnings \
-    --deselect tests/ui/test_history_window.py 2>&1 \
-    | grep -iE "Windows fatal|passed" | head -1
-done
-# 约 1/3 的 run 打印 "Windows fatal exception: access violation"
+正确的本地复现命令应使用 `--ignore` 排除缺少 `qtbot` 的 history 分片：
+
+```powershell
+./runtime/python.exe -m pytest tests/ui -q -p no:warnings `
+  --ignore=tests/ui/test_history_window.py
 ```
 
-## 证据：早于第 3 阶段就存在（非本次回归）
-用 `git stash` 把工作树回退到 **commit 4（`f6c70d4`，TTS 播放端点拆分之前）**，跑 `tests/ui` 4 次：
+原记录使用的 `--deselect tests/ui/test_history_window.py` 在当前 pytest 中不会排除整份文件。
 
-```
-run 1: ....Windows fatal exception: access violation
-run 2: ................................Windows fatal exception: access violation
-run 3: 283 passed
-run 4: 283 passed
-```
+## 历史证据
 
-即播放端点拆分前**同样以相近频率复现**。第 3 阶段（含播放端点 QObject 拆分）未引入也未加重它。
+将工作树回到播放端点拆分前的 `f6c70d4` 附近后，4 次 UI 测试中有 2 次发生相同 access violation，说明问题早于 issue #94 第 3 阶段存在，并非播放端点拆分本身引入。
 
-## 根因假设
-Sakura 的 TTS 合成用「**每请求一个一次性 daemon 线程**」在后台 `emit` Qt 信号回 UI 线程的
-QObject（`TTSPlaybackEndpoint` 的 `_audio_ready`/`_failed` 等）。许多 `tests/ui` / `tests/unit`
-测试创建真实 `GPTSoVITSTTSProvider` 并触发 `speak`/`prepare`，spawn 的 daemon 线程会去连不存在的
-本地服务、随后 `emit` 失败信号。若测试结束、QApplication/event loop 与 Qt C++ 对象在解释器退出阶段
-被销毁，而 daemon 线程仍在 `emit`（或仍有 queued event 指向已释放对象），Shiboken 触及已释放的
-C++ QObject → access violation。
+第 3 阶段另有一个独立回归：`TTSSynthesisSink` 要求 `fail_audio_request` / `skip_audio_request`，但 `TTSPlaybackEndpoint` 仅保留了下划线版本，后台失败和跳过路径会抛出 `AttributeError`。本次一并修复。
 
-这是 daemon-thread-emits-to-QObject 模式在**解释器退出**时的固有竞态，跨 issue #94 整段都存在。
-设计文档（`RUNTIME_RESOURCE_MANAGER_PLAN.md`）的 wrapper-retention / lingering 机制是为运行期的
-double-destruction 设计的，**退出期的这条路径未被覆盖**。
+## 最终归因
 
-## 修复方向（候选，未验证）
-- **测试侧**：给创建真实 provider 的测试加 fixture，在 teardown 里 `provider.close()` +
-  等合成线程收敛（`ThreadResource.stop` join/lingering）后再让 QApplication 退出；或
-  `conftest.py` 的 `_cleanup_qt_objects` 增加「等所有受管 daemon 线程 emit 完成 / 断开信号」步骤。
-- **产品侧**：合成线程在 `emit` 前用 `shiboken6.isValid(sink)` 校验端点存活；或 provider/endpoint
-  在关闭时先 `disconnect()` 全部信号、并设置「不再 emit」哨兵，让在飞 daemon 线程的 emit 变为 no-op。
-- **退出顺序**：确保 `QApplication` 析构前，所有受管线程（含 daemon）已被 `stop_all` 收敛或显式
-  断开与 Qt 对象的连接（可在 RM 增「退出前 quiesce」入口）。
+原记录把崩溃归因于 TTS daemon 线程向已析构 QObject emit。代码检查确认这条链路确实不安全，但完成 TTS 防护后，10 轮 UI 压测仍有 2 轮在普通窗口删除阶段崩溃，因此它不是唯一根因。
 
-## 影响与现状处置
-- **不影响功能**：仅退出期崩溃，不改变任何测试断言结果。
-- CI 不出现（与 `test_history_window`/`sdk` 一样属本地环境/计时问题）。
-- 当前处置：**重跑即可**，以「非崩溃运行是否全绿」为准。后续作为独立任务修复。
+最终确认有两层问题：
+
+1. `TTSSynthesisQueue` 先启动线程、再登记 `ThreadResource`，关闭并发时存在漏管窗口。
+2. Provider 先清理 Qt 播放端点、再 `stop_all()`，在飞合成线程仍可能向端点投递结果。
+3. 合成结果入口没有检查 closed 和 `shiboken6.isValid(endpoint)`；失败清理还会从 daemon 线程直接调用 `QTimer.singleShot`。
+4. 测试创建的真实 Provider 没有统一 teardown，后台线程与 QApplication 清理顺序不确定。
+5. pytest 全局 Qt 清理夹具对每个测试执行 `deleteLater()` 后，多轮调用 `processEvents()` / `sendPostedEvents()`。最终 native 栈直接落在 `_drain_qt_events -> app.processEvents()`；这会执行跨测试残留的普通 queued event，并与对象延迟删除形成竞态。
+
+## 修复措施
+
+### TTS 产品链路
+
+- 合成线程先登记到 `ThreadResource`，再调用 `start()`，消除漏管窗口。
+- Provider 关闭改为幂等两阶段流程：设置 closed 并封闭结果入口，清空待处理请求，调用 `stop_all()` 收敛线程/进程，最后清理播放端点。
+- `deliver_audio`、`deliver_prepared`、`fail_audio_request`、`skip_audio_request` 和 `schedule_cleanup` 统一检查 closed、端点接收状态及 `shiboken6.isValid()`。
+- 合成失败清理通过 queued signal 返回 UI 线程；关闭后迟到音频同步尽力删除，预生成句柄标记失败。
+- 关闭后可能到达的 slot 不再执行 UI 回调或向外发送错误信号。
+
+### pytest 清理链路
+
+- 自动夹具强引用每个测试创建的真实 TTS Provider，并保证 Provider teardown 先于 Qt 对象清理。
+- 顶层窗口仍会先停止可发现的 QThread，再执行容错 `close()` 和 `deleteLater()`。
+- 全局夹具不再调用 `processEvents()`；只调用一次 `sendPostedEvents(..., DeferredDelete)` 处理延迟删除，避免顺带执行普通 queued event。
+- 精简测试窗口的 `closeEvent` 依赖未初始化字段时，夹具容错该异常并继续安排删除。
+- 保留 CI 现有的通用 Qt teardown 兜底；本修复不假设所有未来 Qt native 崩溃都属于 TTS。
+
+## 验证结果
+
+最终代码在 Windows bundled runtime 中完成：
+
+- TTS + ResourceManager 针对性测试：`89 passed`。
+- 完整单元测试曾完成 `711 passed, 3 skipped`。
+- unit、integration、除 history 外的 UI 组合：`1132 passed, 3 skipped, 1 deselected`，退出码 0；被排除的 100ms 时限测试单独运行 `1 passed`。
+- 原 UI 概率复现集合连续运行 10 个独立进程：每轮 `283 passed`，10/10 退出码均为 0，未出现 `0xC0000005`。
+- 高风险 `backchannel + bubble + pet_window` 组合连续 5 轮：每轮 `250 passed`，退出码均为 0。
+- 新增回归测试覆盖线程登记顺序、关闭顺序与幂等性、公开失败/跳过协议、关闭后迟到结果，以及底层 QObject 经 `shiboken6.delete()` 失效后的投递。
+
+组合套件中的 `test_thread_group_stop_uses_one_deadline_and_lingers` 在大量压力日志后曾以 `0.265s` / `0.297s` 超出 `<0.25s` 阈值，单独重跑通过；这是 Windows 调度与日志 I/O 相关的计时抖动，不涉及本次行为修改。
+
+本地 runtime 未安装 `pytest-qt`，因此 `tests/ui/test_history_window.py` 的 5 个 `qtbot` 用例未运行；GitHub CI 会安装开发依赖并覆盖该分片。
+
+测试进程仍可能在 pytest 自身清理 `%TEMP%/pytest-of-LBW/pytest-current` 时输出既有 `WinError 5`，但测试和进程退出码为 0；该权限提示与 Qt native access violation 无关。

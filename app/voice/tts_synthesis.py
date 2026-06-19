@@ -441,9 +441,11 @@ class TTSSynthesisQueue:
             args=(request,),
             daemon=True,
         )
-        thread.start()
+        # 必须先登记再启动：若 close() 恰好落在 start/track 之间，stop_all 会漏掉
+        # 已经运行的线程，使其可能在 Qt 对象析构后继续投递结果。
         if self._thread_resource is not None:
             self._thread_resource.track(thread)
+        thread.start()
 
     def _request_audio(self, tts_request: _TTSRequest) -> None:
         # 请求线程恢复发起方的交互 ID，使本线程内日志可与该次交互串联

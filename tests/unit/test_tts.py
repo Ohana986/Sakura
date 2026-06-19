@@ -10,6 +10,8 @@ import wave
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 if importlib.util.find_spec("PySide6") is None:
     pyside_module = types.ModuleType("PySide6")
     qtcore_module = types.ModuleType("PySide6.QtCore")
@@ -99,6 +101,7 @@ from app.voice.tts import (
 )
 from app.voice.tts_service import GenieServiceSupervisor, TTSServiceSupervisor
 import app.voice.tts_playback as tts_playback
+import app.voice.tts_synthesis as tts_synthesis
 from app.voice.tts_settings import GPTSoVITSTTSSettings, _load_tone_references
 from app.core.gui_log import GUI_LOG_SCOPE_TTS, clear_gui_logs, get_gui_log_buffer
 from app.voice import VoicePlaybackController
@@ -243,6 +246,134 @@ def test_tts_provider_close_clears_queue_and_blocks_late_requests() -> None:
 
     assert not queue._request_running
     assert [request.text for request in queue._pending_requests] == ["stale"]
+
+
+def test_tts_provider_close_quiesces_before_playback_shutdown(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    events: list[str] = []
+
+    monkeypatch.setattr(provider._synthesis_queue, "clear_pending", lambda: events.append("clear"))
+    monkeypatch.setattr(provider._playback, "begin_shutdown", lambda: events.append("begin"))
+
+    def stop_all() -> None:
+        assert provider._is_closed()
+        events.append("stop")
+
+    monkeypatch.setattr(provider._resource_manager, "stop_all", stop_all)
+    monkeypatch.setattr(provider._playback, "shutdown", lambda: events.append("shutdown"))
+
+    provider.close()
+    provider.close()
+
+    assert events == ["clear", "begin", "stop", "shutdown"]
+
+
+def test_tts_synthesis_thread_is_tracked_before_start(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    queue = provider._synthesis_queue
+    events: list[str] = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon) -> None:  # type: ignore[no-untyped-def]
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self) -> None:
+            events.append("start")
+
+    monkeypatch.setattr(tts_synthesis.threading, "Thread", FakeThread)
+    assert queue._thread_resource is not None
+    monkeypatch.setattr(queue._thread_resource, "track", lambda _thread: events.append("track"))
+    queue._pending_requests.append(_TTSRequest(text="test", tone=None))
+
+    queue._start_next_request()
+
+    assert events == ["track", "start"]
+
+
+def test_tts_queue_dispatches_public_failure_and_skip_methods() -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    started: list[str] = []
+    finished: list[str] = []
+    errors: list[str] = []
+    provider.error_occurred.connect(errors.append)
+
+    provider._synthesis_queue._request_audio(
+        _TTSRequest(
+            text="!!!",
+            tone=None,
+            on_started=lambda: started.append("skip"),
+            on_finished=lambda: finished.append("skip"),
+        )
+    )
+
+    class FailingEngine:
+        def synthesize(self, _queue, _request, *, fail, skip):  # type: ignore[no-untyped-def]
+            _ = skip
+            fail("合成失败")
+            return None
+
+    provider._synthesis_queue._engine = FailingEngine()
+    provider._synthesis_queue._request_audio(
+        _TTSRequest(
+            text="test",
+            tone=None,
+            on_started=lambda: started.append("fail"),
+            on_finished=lambda: finished.append("fail"),
+        )
+    )
+
+    assert started == ["skip", "fail"]
+    assert finished == ["skip", "fail"]
+    assert errors == ["合成失败"]
+
+
+def test_closed_playback_discards_late_results(tmp_path: Path) -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    playback = provider._playback
+    provider.close()
+
+    audio_path = tmp_path / "late.wav"
+    prepared_path = tmp_path / "late-prepared.wav"
+    cleanup_path = tmp_path / "late-cleanup.wav"
+    for path in (audio_path, prepared_path, cleanup_path):
+        path.write_bytes(b"wav")
+
+    prepared = TTSPreparedAudio(text="test")
+    playback.deliver_audio(str(audio_path), None, None, "test")
+    playback.deliver_prepared(prepared, str(prepared_path))
+    playback.schedule_cleanup(cleanup_path)
+    playback.fail_audio_request(_TTSRequest(text="test", tone=None, prepared_audio=prepared), "late")
+    playback.skip_audio_request(_TTSRequest(text="test", tone=None, prepared_audio=prepared), "late")
+
+    assert not audio_path.exists()
+    assert not prepared_path.exists()
+    assert not cleanup_path.exists()
+    assert prepared.failed
+
+
+def test_invalid_playback_endpoint_discards_result_without_qt_emit(tmp_path: Path) -> None:
+    if tts_playback.shiboken6 is None:
+        pytest.skip("当前环境没有真实 shiboken6")
+    from PySide6.QtCore import QObject
+
+    parent = QObject()
+    endpoint = tts_playback.TTSPlaybackEndpoint(
+        parent,
+        cache_dir=tmp_path,
+        playback_backend="",
+        is_closed=lambda: False,
+    )
+    audio_path = tmp_path / "invalid-endpoint.wav"
+    audio_path.write_bytes(b"wav")
+
+    tts_playback.shiboken6.delete(endpoint)
+    assert not tts_playback.shiboken6.isValid(endpoint)
+
+    endpoint.deliver_audio(str(audio_path), None, None, "test")
+
+    assert not audio_path.exists()
 
 
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]

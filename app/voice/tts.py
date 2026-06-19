@@ -362,11 +362,15 @@ class GPTSoVITSTTSProvider(QObject):
 
     def close(self) -> None:
         with self._close_lock:
+            if self._closed:
+                return
             self._closed = True
         self._synthesis_queue.clear_pending()
-        self._playback.shutdown()
-        # 本地子进程 + 合成线程由协调器自持的 RM 托管，统一经 stop_all 关闭。
+        # 先封闭后台投递入口，再等待本地子进程和合成线程收敛；只有此后才能
+        # 清理 Qt 播放对象，避免 daemon 线程向析构中的 QObject emit。
+        self._playback.begin_shutdown()
         self._resource_manager.stop_all()
+        self._playback.shutdown()
 
     def _is_closed(self) -> bool:
         with self._close_lock:
