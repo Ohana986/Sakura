@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 import pytest
@@ -15,7 +16,13 @@ from PySide6.QtCore import (  # noqa: E402
     Slot,
 )
 
-from app.core.resource_manager import QtWorkerResource, ResourceManager  # noqa: E402
+from app.core.resource_manager import (  # noqa: E402
+    ProcessResource,
+    QtWorkerResource,
+    ResourceManager,
+    ResourceState,
+    ThreadResource,
+)
 
 
 def _qt_app_or_skip():  # type: ignore[no-untyped-def]
@@ -312,3 +319,220 @@ def test_spawn_qt_worker_unregistered_is_skipped_by_stop_all() -> None:
     assert res not in mgr._resources
     _spin_until(lambda: owner.mig_thread is None)  # type: ignore[attr-defined]
     assert owner.mig_worker is None  # type: ignore[attr-defined]
+
+
+# --- ThreadResource（裸 Python 线程） -------------------------------------
+
+
+def test_thread_resource_track_and_is_running() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    res = mgr.track_python_thread(label="synth")
+    assert isinstance(res, ThreadResource)
+    assert res in mgr._resources
+    assert res.is_running() is False
+
+    done = threading.Event()
+    thread = threading.Thread(target=done.set)
+    thread.start()
+    thread.join()
+    res.track(thread)
+    assert res.state is ResourceState.READY
+    assert res.is_running() is False
+
+
+def test_thread_resource_stop_clean_when_thread_done() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    res = mgr.track_python_thread(label="synth")
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    res.track(thread)
+
+    assert res.stop() is True
+    assert res.state is ResourceState.STOPPED
+    assert res not in mgr._resources
+    assert res.thread is None
+    assert mgr._lingering_threads == []
+
+
+def test_thread_resource_stop_cancel_unblocks_then_joins() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    block = threading.Event()
+    cancelled: list[bool] = []
+
+    def _cancel() -> None:
+        cancelled.append(True)
+        block.set()
+
+    res = mgr.track_python_thread(cancel=_cancel, label="synth")
+    thread = threading.Thread(target=lambda: block.wait(5), daemon=True)
+    thread.start()
+    res.track(thread)
+    assert res.is_running() is True
+
+    # cancel 会设事件让线程退出，join 成功 → 干净停止。
+    assert res.stop(timeout_ms=2000) is True
+    assert cancelled == [True]
+    assert res not in mgr._resources
+    assert mgr._lingering_threads == []
+
+
+def test_thread_resource_stop_timeout_lingers() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    block = threading.Event()
+    thread = threading.Thread(target=lambda: block.wait(5), daemon=True)
+    res = mgr.track_python_thread(label="synth")
+    thread.start()
+    res.track(thread)
+
+    # 没有 cancel，线程仍阻塞 → join 超时转 lingering。
+    assert res.stop(timeout_ms=100) is False
+    assert res not in mgr._resources
+    assert thread in mgr._lingering_threads
+    assert res.thread is None
+    block.set()  # 收尾，避免线程残留
+    thread.join(2)
+
+
+# --- ProcessResource（本地子进程句柄） ------------------------------------
+
+
+class _ProcStub:
+    def __init__(self, *, alive: bool = True) -> None:
+        self.pid = 4321
+        self._alive = alive
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        return None if self._alive else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._alive = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self._alive = False
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        self.waited = True
+        return 0
+
+
+def test_process_resource_stop_terminates() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    proc = _ProcStub(alive=True)
+    res = mgr.adopt_process(proc, label="gpt_sovits")
+    assert isinstance(res, ProcessResource)
+    assert res.state is ResourceState.READY
+    assert res.is_running() is True
+
+    assert res.stop() is True
+    assert proc.terminated is True
+    assert res.process is None
+    assert res.state is ResourceState.STOPPED
+    assert res not in mgr._resources
+
+
+def test_process_resource_stop_when_already_exited_skips_terminate() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    proc = _ProcStub(alive=False)
+    res = mgr.adopt_process(proc, label="x")
+    assert res.is_running() is False
+
+    assert res.stop() is True
+    assert proc.terminated is False
+    assert res not in mgr._resources
+
+
+def test_process_resource_stop_uses_custom_terminator() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    calls: list[tuple[object, int]] = []
+
+    def terminator(process: object, timeout: int) -> None:
+        calls.append((process, timeout))
+        process.terminate()  # type: ignore[attr-defined]
+
+    proc = _ProcStub(alive=True)
+    res = mgr.adopt_process(proc, terminator=terminator, terminate_timeout_s=7, label="x")
+    res.stop()
+    assert calls and calls[0][0] is proc and calls[0][1] == 7
+    assert proc.terminated is True
+
+
+def test_process_resource_detach_keeps_process_alive() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    proc = _ProcStub(alive=True)
+    res = mgr.adopt_process(proc, label="x")
+
+    handle = res.detach()
+    assert handle is proc
+    assert proc.terminated is False
+    assert proc.killed is False
+    assert res.process is None
+    assert res not in mgr._resources
+    # detach 之后 stop 是干净的 no-op。
+    assert res.stop() is True
+
+
+def test_process_resource_restart_replaces_handle() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    old = _ProcStub(alive=True)
+    new = _ProcStub(alive=True)
+    res = mgr.adopt_process(old, restart_factory=lambda: new, label="x")
+
+    assert res.restart() is True
+    assert old.terminated is True
+    assert res.process is new
+    assert res.state is ResourceState.READY
+
+
+def test_process_resource_restart_without_factory_clears_handle() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    old = _ProcStub(alive=True)
+    res = mgr.adopt_process(old, label="x")
+
+    assert res.restart() is True
+    assert old.terminated is True
+    assert res.process is None
+    assert res.state is ResourceState.NEW
+
+
+def test_process_resource_health_reflects_liveness() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    proc = _ProcStub(alive=True)
+    res = mgr.adopt_process(proc, label="x")
+    assert res.health() is ResourceState.READY
+
+    proc._alive = False
+    assert res.health() is ResourceState.STOPPED
+
+
+def test_stop_all_mixes_qt_thread_and_process_resources() -> None:
+    _qt_app_or_skip()
+    mgr = ResourceManager()
+    proc = _ProcStub(alive=True)
+    process_res = mgr.adopt_process(proc, label="proc")
+    thread_res = mgr.track_python_thread(label="synth")
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    thread_res.track(thread)
+
+    mgr.stop_all()
+    assert proc.terminated is True
+    assert process_res not in mgr._resources
+    assert thread_res not in mgr._resources
