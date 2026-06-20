@@ -1098,7 +1098,7 @@ class AgentRuntime:
     def _build_tool_system_prompt(
         self,
         allow_screen_observation: bool = False,
-        extra_instructions: str = “”,
+        extra_instructions: str = "",
         browser_page_mode: bool = False,
         visible_browser_mode: bool = False,
     ) -> str:
@@ -1114,10 +1114,10 @@ class AgentRuntime:
         self,
         snapshot: ContextSnapshot | None,
         *,
-        extra_instructions: str = “”,
+        extra_instructions: str = "",
     ):
         proactive_rules = build_proactive_check_tool_system_prefix(
-            “”,
+            "",
             self.reply_tones,
             self.reply_portraits,
             max_tool_calls_per_step=self.runtime_loop_settings.max_tool_calls_per_step,
