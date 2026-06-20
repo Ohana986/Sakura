@@ -76,6 +76,7 @@ from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
     normalize_portrait_scale_percent,
 )
+from app.ui.error_messages import format_failure_message
 from app.ui.control_panel_layout import (
     DEFAULT_BUBBLE_HEIGHT,
     DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
@@ -817,7 +818,15 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "处理中", "记忆模型正在安装或导入，请等待完成。")
             return
         if not callable(getattr(self.memory_store, "download_embedding_model", None)):
-            QMessageBox.warning(self, "安装失败", "当前记忆模块不支持在线安装模型。")
+            QMessageBox.warning(
+                self,
+                "安装失败",
+                format_failure_message(
+                    "当前记忆模块不支持在线安装模型。",
+                    "请下载记忆模型 ZIP，并使用设置页的手动导入功能。",
+                    "当前记忆模块没有 download_embedding_model 接口。",
+                ),
+            )
             return
         if not self._memory_entries_loaded_once:
             self._ensure_memory_entries_loaded()
@@ -955,7 +964,15 @@ class SettingsDialog(QDialog):
     @Slot(str)
     def _handle_memory_model_import_failed(self, message: str) -> None:
         self.memory_status_label.setText(f"导入失败：{message}")
-        QMessageBox.warning(self, "导入失败", message)
+        QMessageBox.warning(
+            self,
+            "导入失败",
+            format_failure_message(
+                "记忆模型 ZIP 没有成功导入。",
+                "请确认 ZIP 来自 Sakura Release、没有手动改名或解压，然后重新导入。",
+                message,
+            ),
+        )
 
     @Slot(object)
     def _handle_memory_model_download_success(self, result: EmbeddingModelImportResult) -> None:
@@ -974,7 +991,17 @@ class SettingsDialog(QDialog):
     @Slot(str)
     def _handle_memory_model_download_failed(self, message: str) -> None:
         self.memory_status_label.setText(f"安装失败：{message}")
-        QMessageBox.warning(self, "安装失败", message)
+        QMessageBox.warning(
+            self,
+            "安装失败",
+            format_failure_message(
+                "记忆模型没有在线安装成功。",
+                "请开启代理后重试，或下载下面的 ZIP 并在设置页手动导入：\n"
+                "https://github.com/Rvosy/Sakura/releases/download/v0.9.7/"
+                "models--sentence-transformers--all-MiniLM-L6-v2.zip",
+                message,
+            ),
+        )
 
     @Slot(object)
     def _handle_backchannel_model_import_success(self, result: BackchannelModelImportResult) -> None:
@@ -993,7 +1020,15 @@ class SettingsDialog(QDialog):
     def _handle_backchannel_model_import_failed(self, message: str) -> None:
         if hasattr(self, "backchannel_model_status_label"):
             self.backchannel_model_status_label.setText(f"导入失败：{message}")
-        QMessageBox.warning(self, "导入失败", message)
+        QMessageBox.warning(
+            self,
+            "导入失败",
+            format_failure_message(
+                "接话模型 ZIP 没有成功导入。",
+                "请确认选择了完整、未解压的接话模型 ZIP 后重试。",
+                message,
+            ),
+        )
 
     @Slot(object)
     def _handle_backchannel_model_download_success(self, result: BackchannelModelImportResult) -> None:
@@ -1012,7 +1047,15 @@ class SettingsDialog(QDialog):
     def _handle_backchannel_model_download_failed(self, message: str) -> None:
         if hasattr(self, "backchannel_model_status_label"):
             self.backchannel_model_status_label.setText(f"安装失败：{message}")
-        QMessageBox.warning(self, "安装失败", message)
+        QMessageBox.warning(
+            self,
+            "安装失败",
+            format_failure_message(
+                "接话模型没有在线安装成功。",
+                "请检查 Hugging Face 访问、网络或代理后重试，也可以在设置页手动导入模型 ZIP。",
+                message,
+            ),
+        )
 
     @Slot()
     def _reset_memory_model_import_worker(self) -> None:
@@ -1151,7 +1194,15 @@ class SettingsDialog(QDialog):
         self._memory_entries_loaded_once = False
         self.memory_status_label.setText(f"读取失败：{message}")
         self._show_memory_placeholder("记忆读取失败，请稍后重试。")
-        QMessageBox.warning(self, "读取失败", message)
+        QMessageBox.warning(
+            self,
+            "读取失败",
+            format_failure_message(
+                "长期记忆列表没有读取成功。",
+                "请确认记忆模型已经安装，稍后重新打开记忆页或重启 Sakura。",
+                message,
+            ),
+        )
 
     @Slot()
     def _reset_memory_list_worker(self) -> None:
@@ -1578,7 +1629,15 @@ class SettingsDialog(QDialog):
                 self.memory_new_button.setChecked(False)
                 success_message = "记忆已保存。"
         except (RuntimeError, ValueError) as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
+            QMessageBox.warning(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "这条长期记忆没有保存成功。",
+                    "请确认长期记忆系统已经就绪，并检查内容后重试。",
+                    exc,
+                ),
+            )
             return
         self._load_memory_entries()
         QMessageBox.information(self, "保存成功", success_message)
@@ -1655,7 +1714,11 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "删除完成",
-                f"已删除 {deleted} 条，失败 {len(failed)} 条。\n" + "\n".join(failed),
+                format_failure_message(
+                    f"已删除 {deleted} 条记忆，另有 {len(failed)} 条删除失败。",
+                    "请刷新记忆列表后重试失败项。",
+                    "\n".join(failed),
+                ),
             )
 
     def _selected_memory_rows(self) -> list[int]:
@@ -2118,7 +2181,15 @@ class SettingsDialog(QDialog):
         try:
             plugin_config_changed = self._save_plugin_settings_if_needed()
         except OSError as exc:
-            QMessageBox.critical(self, "保存失败", f"无法保存插件配置：{exc}")
+            QMessageBox.critical(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "插件启用配置没有保存成功。",
+                    "请检查插件配置文件的写入权限和占用情况后重试。",
+                    exc,
+                ),
+            )
             return
 
         self.result_api_settings = api_settings
@@ -2280,9 +2351,25 @@ class SettingsDialog(QDialog):
     @Slot(str)
     def _handle_api_test_failed(self, message: str) -> None:
         if self._pending_api_accept_values is not None:
-            QMessageBox.warning(self, "API 检测失败", f"{message}\n\n设置尚未保存，请修正 API 配置后再保存。")
+            QMessageBox.warning(
+                self,
+                "API 检测失败",
+                format_failure_message(
+                    "API 连接检测失败，设置尚未保存。",
+                    "请检查网络或代理，以及 Base URL、API Key 和模型名称后再保存。",
+                    message,
+                ),
+            )
             return
-        QMessageBox.warning(self, "测试失败", message)
+        QMessageBox.warning(
+            self,
+            "测试失败",
+            format_failure_message(
+                "API 连接测试没有成功。",
+                "请检查网络或代理，以及 Base URL、API Key 和模型名称后重试。",
+                message,
+            ),
+        )
 
     @Slot()
     def _reset_api_test_state(self) -> None:
@@ -2338,14 +2425,30 @@ class SettingsDialog(QDialog):
     @Slot(list)
     def _handle_api_model_probe_success(self, model_names: list[str]) -> None:
         if not model_names:
-            QMessageBox.warning(self, "探测失败", "模型列表为空，请检查服务是否暴露 /models 接口。")
+            QMessageBox.warning(
+                self,
+                "探测失败",
+                format_failure_message(
+                    "API 服务返回了空的模型列表。",
+                    "请确认服务提供 /models 接口，并检查当前账号是否有可用模型。",
+                    "模型列表为空。",
+                ),
+            )
             return
         self.model_edit.set_model_names(model_names)
         QMessageBox.information(self, "探测成功", f"已发现 {len(model_names)} 个模型。")
 
     @Slot(str)
     def _handle_api_model_probe_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "探测失败", message)
+        QMessageBox.warning(
+            self,
+            "探测失败",
+            format_failure_message(
+                "无法从 API 服务读取模型列表。",
+                "请检查网络、代理、Base URL 和 API Key，并确认服务提供 /models 接口。",
+                message,
+            ),
+        )
 
     @Slot()
     def _reset_api_model_probe_state(self) -> None:
@@ -2425,7 +2528,11 @@ class SettingsDialog(QDialog):
         QMessageBox.warning(
             self,
             "TTS 检测失败",
-            f"{message}\n\nTTS 设置已保留并继续保存。若保存后仍无法发声，请重启本地 TTS 服务或确认工作目录有效。",
+            format_failure_message(
+                "TTS 服务检测失败，但 TTS 设置会保留并继续保存。",
+                "请重启本地 TTS 服务，并检查服务地址、工作目录、Python 和模型路径。",
+                message,
+            ),
         )
         accept_values["tts_settings"] = original_settings
         self._complete_accept(accept_values)
@@ -2525,7 +2632,15 @@ class SettingsDialog(QDialog):
             self._sync_character_archive_controls()
             imported_profile = self._selected_character_profile()
         except (CharacterArchiveError, OSError, ValueError) as exc:
-            QMessageBox.warning(self, "导入失败", str(exc))
+            QMessageBox.warning(
+                self,
+                "导入失败",
+                format_failure_message(
+                    "角色包没有成功导入。",
+                    "请确认角色包完整、格式正确，并检查 characters 目录的写入权限。",
+                    exc,
+                ),
+            )
             return
         if imported_profile is not None and imported_profile.voice is None:
             self.tts_enabled_check.setChecked(False)
@@ -2567,7 +2682,15 @@ class SettingsDialog(QDialog):
             imported_profile = self._selected_character_profile()
             self._sync_voice_import_controls()
         except (CharacterArchiveError, OSError, ValueError) as exc:
-            QMessageBox.warning(self, "导入失败", str(exc))
+            QMessageBox.warning(
+                self,
+                "导入失败",
+                format_failure_message(
+                    "角色语音包没有成功导入。",
+                    "请确认语音包与当前角色匹配、文件完整，并检查写入权限。",
+                    exc,
+                ),
+            )
             return
         QMessageBox.information(
             self,
@@ -2648,7 +2771,15 @@ class SettingsDialog(QDialog):
 
     @Slot(str)
     def _handle_character_export_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "导出失败", message)
+        QMessageBox.warning(
+            self,
+            "导出失败",
+            format_failure_message(
+                "角色包没有成功导出。",
+                "请检查目标目录的空间、写入权限和文件占用情况后重试。",
+                message,
+            ),
+        )
 
     @Slot()
     def _reset_character_export_state(self) -> None:
@@ -2776,9 +2907,10 @@ class SettingsDialog(QDialog):
         work_dir = _optional_path(self.tts_work_dir_edit.text(), self.base_dir)
         python_path = None if bundled else _optional_path(self.tts_python_path_edit.text(), self.base_dir)
         tts_config_path = None if bundled else _optional_path(self.tts_config_path_edit.text(), self.base_dir)
-        ref_lang = "ja"
-        text_lang = "ja"
         selected_profile = self._selected_character_profile()
+        selected_voice = selected_profile.voice if selected_profile is not None else None
+        ref_lang = (selected_voice.ref_lang if selected_voice is not None else self.tts_settings.ref_lang) or "ja"
+        text_lang = (selected_voice.text_lang if selected_voice is not None else self.tts_settings.text_lang) or "ja"
 
         if enabled and selected_profile is not None and selected_profile.voice is None:
             enabled = False
@@ -2839,7 +2971,15 @@ class SettingsDialog(QDialog):
                 settings.validate()
             except TTSConfigError as exc:
                 if show_warnings:
-                    QMessageBox.warning(self, "配置无效", str(exc))
+                    QMessageBox.warning(
+                        self,
+                        "配置无效",
+                        format_failure_message(
+                            "TTS 配置无法通过检查。",
+                            "请检查 Python、工作目录、模型、推理配置和参考音频路径。",
+                            exc,
+                        ),
+                    )
                 return None
         return settings
 

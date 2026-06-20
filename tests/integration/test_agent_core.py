@@ -361,6 +361,18 @@ def test_memory_store_builds_local_mem0_config() -> None:
     assert "memory/text" in config["custom_instructions"]
 
 
+def test_memory_download_failure_suggests_manual_import_or_proxy_restart() -> None:
+    message = memory_module._format_memory_load_error(
+        RuntimeError("offline"),
+        embedding_download=True,
+    )
+
+    assert "models--sentence-transformers--all-MiniLM-L6-v2.zip" in message
+    assert "https://github.com/Rvosy/Sakura/releases/download/v0.9.7/" in message
+    assert "设置页手动导入" in message
+    assert "开启代理并重启 Sakura" in message
+
+
 def test_memory_store_reuses_runtime_when_api_settings_unchanged() -> None:
     settings = ApiSettings(
         base_url="https://api.example.com/v1",

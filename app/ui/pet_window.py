@@ -118,6 +118,7 @@ from app.plugins.events import (
     EVENT_TTS_STARTED,
 )
 from app.ui.state import PetUiState, PetUiStateStore
+from app.ui.error_messages import format_failure_message
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
     set_launch_at_login_enabled,
@@ -2746,7 +2747,15 @@ class PetWindow(QWidget):
         try:
             desktop_pixmap, virtual_geometry = self._capture_virtual_desktop_pixmap()
         except RuntimeError as exc:
-            show_themed_warning(self, "截图失败", str(exc))
+            show_themed_warning(
+                self,
+                "截图失败",
+                format_failure_message(
+                    "无法打开框选截图界面。",
+                    "请检查系统截图权限后重试。",
+                    exc,
+                ),
+            )
             debug_log("PetWindow", "手动框选截图启动失败", {"error": str(exc)})
             return
 
@@ -2767,7 +2776,15 @@ class PetWindow(QWidget):
         self.show()
         self.raise_()
         if pixmap.isNull():
-            show_themed_warning(self, "截图失败", "框选截图为空。")
+            show_themed_warning(
+                self,
+                "截图失败",
+                format_failure_message(
+                    "没有截取到有效的画面。",
+                    "请重新框选一个有内容的屏幕区域。",
+                    "框选截图为空。",
+                ),
+            )
             return
         if not self._start_screen_observation_encode(
             CapturedScreenImage(
@@ -3390,7 +3407,15 @@ class PetWindow(QWidget):
         elif kind in {"screen_awareness_context", "proactive_context"}:
             debug_log("ScreenAwareness", "主动屏幕上下文编码失败", {"error": message})
         elif kind == "manual":
-            show_themed_warning(self, "截图失败", message)
+            show_themed_warning(
+                self,
+                "截图失败",
+                format_failure_message(
+                    "截图已经获取，但图片处理失败。",
+                    "请缩小截图范围后重试，并保留下面的诊断信息。",
+                    message,
+                ),
+            )
             debug_log("PetWindow", "手动框选截图编码失败", {"error": message})
 
     @Slot(object)
@@ -4131,7 +4156,15 @@ class PetWindow(QWidget):
         self.subtitle_controller.cancel_reply_flow(
             "……通信に失敗した。設定を確認して。", transition=True
         )
-        show_themed_warning(self, "请求失败", message)
+        show_themed_warning(
+            self,
+            "请求失败",
+            format_failure_message(
+                "聊天请求没有成功完成。",
+                "请检查网络或代理，以及设置中的 Base URL、API Key 和模型名称后重试。",
+                message,
+            ),
+        )
         self._end_interaction("error")
 
     @Slot()
@@ -4676,7 +4709,16 @@ class PetWindow(QWidget):
             return
         self.memory_failure_dialog_pending_message = ""
         self.memory_failure_dialog_last_message = message
-        show_themed_warning(self, "记忆模型下载失败", message)
+        show_themed_warning(
+            self,
+            "记忆模型下载失败",
+            format_failure_message(
+                "长期记忆所需的本地模型没有下载成功。",
+                "请按诊断信息中的 Release 链接下载 ZIP 后在设置页手动导入，"
+                "或开启代理并重启 Sakura 重新下载。",
+                message,
+            ),
+        )
 
     @Slot()
     def _show_pending_memory_status_after_startup(self) -> None:
@@ -4853,7 +4895,15 @@ class PetWindow(QWidget):
                 character_profile=self.character_profile,
             )
         except (OSError, TTSConfigError) as exc:
-            show_themed_warning(self, "配置读取失败", f"TTS 配置读取失败，将使用默认值打开设置：{exc}")
+            show_themed_warning(
+                self,
+                "配置读取失败",
+                format_failure_message(
+                    "TTS 配置无法读取，设置页将使用默认值打开。",
+                    "请检查配置文件是否损坏、被占用或没有读取权限。",
+                    exc,
+                ),
+            )
             tts_settings = self._default_tts_settings()
 
         screen_awareness_settings = getattr(self, "screen_awareness_settings", None)
@@ -5043,7 +5093,15 @@ class PetWindow(QWidget):
         try:
             selected_profile = dialog_character_registry.get(dialog.result_character_id)
         except CharacterConfigError as exc:
-            show_themed_critical(self, "角色配置无效", str(exc))
+            show_themed_critical(
+                self,
+                "角色配置无效",
+                format_failure_message(
+                    "无法读取当前选择的角色配置。",
+                    "请重新导入或选择一个完整的角色包。",
+                    exc,
+                ),
+            )
             return
 
         new_tts_provider = self._create_tts_provider_from_settings(dialog.result_tts_settings)
@@ -5117,7 +5175,15 @@ class PetWindow(QWidget):
                     result_memory_curation_settings
                 )
         except (CharacterConfigError, OSError) as exc:
-            show_themed_critical(self, "保存失败", f"无法保存设置：{exc}")
+            show_themed_critical(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "设置没有保存成功。",
+                    "请检查 data 目录的写入权限和文件占用情况后重试。",
+                    exc,
+                ),
+            )
             return
 
         if api_changed:
@@ -5250,7 +5316,15 @@ class PetWindow(QWidget):
         except OSError as exc:
             self.subtitle_language = previous_language
             self._apply_speech_font()
-            show_themed_warning(self, "保存失败", f"无法保存字幕设置：{exc}")
+            show_themed_warning(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "字幕设置没有保存成功。",
+                    "请检查配置文件的写入权限和占用情况后重试。",
+                    exc,
+                ),
+            )
             return
 
         self._apply_speech_font()
@@ -5285,7 +5359,15 @@ class PetWindow(QWidget):
                 },
             )
         except OSError as exc:
-            show_themed_warning(self, "保存失败", f"无法保存自主看屏幕设置：{exc}")
+            show_themed_warning(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "自主看屏幕设置没有保存成功。",
+                    "请检查配置文件的写入权限和占用情况后重试。",
+                    exc,
+                ),
+            )
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
 
@@ -5307,7 +5389,15 @@ class PetWindow(QWidget):
             self._save_system_config_values("ui", {"always_on_top_enabled": checked})
         except OSError as exc:
             self.always_on_top_enabled = previous_enabled
-            show_themed_warning(self, "保存失败", f"无法保存置顶设置：{exc}")
+            show_themed_warning(
+                self,
+                "保存失败",
+                format_failure_message(
+                    "窗口置顶设置没有保存成功。",
+                    "请检查配置文件的写入权限和占用情况后重试。",
+                    exc,
+                ),
+            )
             return
 
         self._apply_window_flags()
@@ -5357,7 +5447,15 @@ class PetWindow(QWidget):
             return provider
         except TTSConfigError as exc:
             debug_log("PetWindow", "TTS 配置无效", {"error": str(exc)})
-            show_themed_critical(self, "TTS 配置无效", f"无法启用 TTS，当前语音配置保持不变：{exc}")
+            show_themed_critical(
+                self,
+                "TTS 配置无效",
+                format_failure_message(
+                    "TTS 无法启用，当前语音配置保持不变。",
+                    "请检查 TTS 服务地址、Python、模型、推理配置和参考音频路径。",
+                    exc,
+                ),
+            )
             return None
 
     def _retire_tts_provider(

@@ -601,7 +601,12 @@ def test_memory_status_does_not_use_tray_balloon(monkeypatch) -> None:  # type: 
         "reloading message",
         "failed message",
     ]
-    assert warnings == [("记忆模型下载失败", "failed message")]
+    assert len(warnings) == 1
+    assert warnings[0][0] == "记忆模型下载失败"
+    assert "发生了什么" in warnings[0][1]
+    assert "处理建议" in warnings[0][1]
+    assert "诊断信息（截图时请保留）" in warnings[0][1]
+    assert "failed message" in warnings[0][1]
     assert single_shots == [(pet_window_module.MEMORY_STATUS_DISPLAY_MS, window._restore_memory_status_speech)]
 
 
@@ -656,7 +661,10 @@ def test_memory_failure_dialog_is_deferred_until_startup_window_is_visible(monke
     PetWindow._show_pending_memory_status_after_startup(window)
 
     assert window.subtitle_controller.messages == ["download failed"]
-    assert warnings == [("记忆模型下载失败", "download failed")]
+    assert len(warnings) == 1
+    assert warnings[0][0] == "记忆模型下载失败"
+    assert "处理建议" in warnings[0][1]
+    assert "download failed" in warnings[0][1]
     assert window.memory_failure_dialog_pending_message == ""
 
 
@@ -2197,8 +2205,6 @@ def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
         dialog.tts_work_dir_edit,
         dialog.tts_python_path_edit,
         dialog.tts_config_path_edit,
-        dialog.ref_lang_edit,
-        dialog.text_lang_edit,
         dialog.tts_timeout_spin,
     )
     assert all(not widget.isEnabled() for widget in controlled_widgets)
@@ -2216,8 +2222,6 @@ def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
             dialog.tts_config_path_edit,
         )
     )
-    assert dialog.ref_lang_edit.isEnabled()
-    assert dialog.text_lang_edit.isEnabled()
     assert dialog.tts_timeout_spin.isEnabled()
     assert dialog.tts_bundle_download_button.isEnabled()
 
@@ -4113,7 +4117,8 @@ def test_settings_dialog_tts_test_failure_keeps_enabled_settings(monkeypatch) ->
     dialog.accept()
 
     assert warnings and "服务启动失败" in warnings[0]
-    assert "TTS 设置已保留" in warnings[0]
+    assert "TTS 设置会保留" in warnings[0]
+    assert "诊断信息（截图时请保留）" in warnings[0]
     assert dialog.tts_enabled_check.isChecked()
     assert dialog.result_tts_settings is not None
     assert dialog.result_tts_settings.enabled
@@ -4325,7 +4330,9 @@ def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) ->
 
     dialog._handle_api_model_probe_failed("无法连接")
 
-    assert warnings == ["无法连接"]
+    assert len(warnings) == 1
+    assert "处理建议" in warnings[0]
+    assert "诊断信息（截图时请保留）：\n无法连接" in warnings[0]
     assert dialog.model_edit.currentText() == "current-model"
     assert dialog.result_api_settings is None
     dialog.deleteLater()
@@ -4956,8 +4963,12 @@ def test_settings_dialog_imports_voice_archive_for_selected_character(monkeypatc
     assert imported.voice is not None
     assert imported.voice.gpt_model_path is not None
     assert imported.voice.gpt_model_path.read_bytes() == b"imported-gpt"
-    assert dialog.ref_lang_edit.text() == "zh"
-    assert dialog.text_lang_edit.text() == "zh"
+    assert imported.voice.ref_lang == "zh"
+    assert imported.voice.text_lang == "zh"
+    settings = dialog._validated_tts_settings(show_warnings=False, validate_enabled=False)
+    assert settings is not None
+    assert settings.ref_lang == "zh"
+    assert settings.text_lang == "zh"
 
     dialog.deleteLater()
     app.processEvents()
@@ -5619,6 +5630,26 @@ def test_settings_dialog_downloads_memory_model(monkeypatch) -> None:  # type: i
     app.processEvents()
 
 
+def test_settings_dialog_memory_model_download_failure_shows_release_link(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog = type("DialogStub", (), {})()
+    dialog.memory_status_label = type("LabelStub", (), {"setText": lambda self, _text: None})()
+
+    SettingsDialog._handle_memory_model_download_failed(dialog, "HTTP 403")
+
+    assert len(warnings) == 1
+    assert "models--sentence-transformers--all-MiniLM-L6-v2.zip" in warnings[0]
+    assert "诊断信息（截图时请保留）：\nHTTP 403" in warnings[0]
+
+
 def test_settings_dialog_imports_backchannel_model_archive(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -5934,7 +5965,8 @@ def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> N
     dialog._delete_memory_entry()
 
     assert warnings
-    assert "已删除 1 条，失败 1 条" in warnings[-1]
+    assert "已删除 1 条记忆，另有 1 条删除失败" in warnings[-1]
+    assert "诊断信息（截图时请保留）" in warnings[-1]
     assert "后端删除失败" in warnings[-1]
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     dialog.deleteLater()

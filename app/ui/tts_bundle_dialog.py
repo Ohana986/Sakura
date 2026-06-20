@@ -28,6 +28,7 @@ from app.voice.tts_bundle import (
     list_nvidia_gpus,
     recommend_tts_bundle,
 )
+from app.ui.error_messages import format_failure_message
 
 
 class TTSBundleDownloadThread(QThread):
@@ -193,7 +194,15 @@ class TTSBundleDownloadDialog(QDialog):
 
     @Slot(str)
     def _handle_failure(self, message: str) -> None:
-        QMessageBox.warning(self, "下载失败", message)
+        QMessageBox.warning(
+            self,
+            "下载失败",
+            format_failure_message(
+                "TTS 整合包没有下载或安装成功。",
+                "请检查网络、代理、磁盘空间和目录权限后重试。",
+                message,
+            ),
+        )
         self.bundle_combo.setEnabled(bool(self._entries))
         self.start_button.setEnabled(bool(self._entries))
         self.cancel_button.setText("关闭")
@@ -233,7 +242,15 @@ class TTSBundleDownloadDialog(QDialog):
         try:
             cleanup_stale_download_archives(self.base_dir)
         except RuntimeError as exc:
-            QMessageBox.warning(self, "清理旧压缩包失败", str(exc))
+            QMessageBox.warning(
+                self,
+                "清理旧压缩包失败",
+                format_failure_message(
+                    "旧的 TTS 下载压缩包没有清理成功。",
+                    "请关闭占用该文件的程序，检查目录权限后重新打开下载窗口。",
+                    exc,
+                ),
+            )
 
     def reject(self) -> None:
         if self._thread is not None and self._thread.isRunning():

@@ -1457,7 +1457,11 @@ def _format_memory_load_error(exc: Exception, *, embedding_download: bool) -> st
         return f"长期记忆系统初始化失败：{raw_message}"
     return (
         "长期记忆系统初始化失败：本地嵌入模型下载失败，"
-        "请检查 HuggingFace 访问、网络或代理后重试；普通聊天仍可继续。"
+        "请前往项目 Release 下载 models--sentence-transformers--all-MiniLM-L6-v2.zip，"
+        "然后在设置页手动导入：\n"
+        "https://github.com/Rvosy/Sakura/releases/download/v0.9.7/"
+        "models--sentence-transformers--all-MiniLM-L6-v2.zip\n"
+        "也可以尝试开启代理并重启 Sakura 重新下载；普通聊天仍可继续。"
         f"\n\n原始错误：{raw_message}"
     )
 
