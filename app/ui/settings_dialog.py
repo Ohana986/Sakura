@@ -67,7 +67,7 @@ from app.config.settings_service import (
     StartupSettings,
 )
 from app.platforms.launch_at_login import is_launch_at_login_supported
-from app.llm.api_client import ApiSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.plugins.discovery import PluginDiscovery, save_plugin_enabled_overrides
 from app.plugins.models import PluginSpec
 from app.config.character_loader import (
@@ -2754,7 +2754,9 @@ class SettingsDialog(QDialog):
         key_edit.setPlaceholderText("API Key（本地模型可留空）")
         models_edit = QPlainTextEdit(dialog)
         models_edit.setPlaceholderText("每行一个模型名称")
-        models_edit.setFixedHeight(86)
+        models_edit.setObjectName("providerModelsEdit")
+        models_edit.setMinimumHeight(112)
+        models_edit.setTabChangesFocus(True)
         show_key_check = QCheckBox("显示 Key", dialog)
 
         def toggle_key_visibility(checked: bool) -> None:
@@ -2762,6 +2764,7 @@ class SettingsDialog(QDialog):
         show_key_check.toggled.connect(toggle_key_visibility)
 
         save_row_btn = QPushButton("保存到选中行", dialog)
+        probe_models_btn = QPushButton("检测模型", dialog)
         add_row_btn = QPushButton("添加新行", dialog)
         delete_btn = QPushButton("删除选中", dialog)
 
@@ -2777,7 +2780,6 @@ class SettingsDialog(QDialog):
                 table.setItem(i, 2, QTableWidgetItem(key_display))
                 table.setItem(i, 3, QTableWidgetItem(f"{len(p.models)} 个"))
                 table.item(i, 0).setData(Qt.ItemDataRole.UserRole, p.id)
-            _clear_edit()
 
         def _clear_edit() -> None:
             nonlocal _selected_id_for_edit
@@ -2786,6 +2788,22 @@ class SettingsDialog(QDialog):
             url_edit.clear()
             key_edit.clear()
             models_edit.clear()
+
+        def _profile_index(profile_id: str | None) -> int:
+            if not profile_id:
+                return -1
+            for index, profile in enumerate(profiles):
+                if profile.id == profile_id:
+                    return index
+            return -1
+
+        def _select_profile(profile_id: str | None) -> None:
+            row = _profile_index(profile_id)
+            if row < 0:
+                _clear_edit()
+                return
+            table.setCurrentCell(row, 0)
+            on_table_selection_changed()
 
         def on_table_selection_changed() -> None:
             nonlocal _selected_id_for_edit
@@ -2835,16 +2853,15 @@ class SettingsDialog(QDialog):
                             api_key=api_key,
                             models=model_names,
                         )
+                        _selected_id_for_edit = p.id
                         break
             else:
                 new_id = _next_profile_id(profiles)
                 profiles.append(ApiConfigProfile(id=new_id, alias=alias, base_url=base_url, api_key=api_key, models=model_names))
                 _selected_id_for_edit = new_id
+            selected_id = _selected_id_for_edit
             refresh_table()
-            for i, p in enumerate(profiles):
-                if p.id == _selected_id_for_edit:
-                    table.setCurrentCell(i, 0)
-                    break
+            _select_profile(selected_id)
 
         def on_add_row() -> None:
             nonlocal _selected_id_for_edit
@@ -2858,10 +2875,7 @@ class SettingsDialog(QDialog):
             models_edit.clear()
             alias_edit.setFocus()
             refresh_table()
-            for i, p in enumerate(profiles):
-                if p.id == new_id:
-                    table.setCurrentCell(i, 0)
-                    break
+            _select_profile(new_id)
 
         def on_delete_row() -> None:
             row = table.currentRow()
@@ -2874,8 +2888,120 @@ class SettingsDialog(QDialog):
                 return
             profiles.pop(row)
             refresh_table()
+            if profiles:
+                _select_profile(profiles[min(row, len(profiles) - 1)].id)
+            else:
+                _clear_edit()
+
+        def on_probe_models() -> None:
+            base_url = url_edit.text().strip()
+            api_key = key_edit.text().strip()
+            if not base_url:
+                QMessageBox.warning(dialog, "配置无效", "请先填写当前供应商的 Base URL。")
+                return
+            timeout_spin = getattr(self, "api_timeout_spin", None)
+            timeout_seconds = (
+                int(timeout_spin.value())
+                if timeout_spin is not None
+                else self._initial_api_settings.timeout_seconds
+            )
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                model_names = OpenAICompatibleClient(
+                    ApiSettings(
+                        base_url=base_url.rstrip("/"),
+                        api_key=api_key,
+                        model="",
+                        timeout_seconds=timeout_seconds,
+                    )
+                ).list_models()
+            except Exception as exc:
+                QMessageBox.warning(
+                    dialog,
+                    "检测失败",
+                    format_failure_message(
+                        "没有成功获取供应商模型列表。",
+                        "请检查 Base URL、API Key、网络或代理后重试。",
+                        exc,
+                    ),
+                )
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not model_names:
+                QMessageBox.warning(dialog, "检测失败", "API 服务返回了空的模型列表。")
+                return
+            selected = _choose_models(model_names, set(_dedupe(models_edit.toPlainText().splitlines())))
+            if not selected:
+                return
+            merged = _dedupe([*models_edit.toPlainText().splitlines(), *selected])
+            models_edit.setPlainText("\n".join(merged))
+            QMessageBox.information(dialog, "添加完成", f"已添加 {len(selected)} 个模型。")
+
+        def _choose_models(model_names: list[str], existing: set[str]) -> list[str]:
+            selector = QDialog(dialog)
+            selector.setWindowTitle(f"选择模型 — 共 {len(model_names)} 个")
+            selector.setMinimumSize(420, 460)
+            selector.setObjectName("modelSelectionDialog")
+            if self.styleSheet():
+                selector.setStyleSheet(self.styleSheet())
+
+            scroll = QScrollArea(selector)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            body = QWidget(scroll)
+            body_layout = QVBoxLayout(body)
+            body_layout.setContentsMargins(0, 0, 0, 0)
+            body_layout.setSpacing(4)
+            checkboxes: list[QCheckBox] = []
+            for name in _dedupe(model_names):
+                cb = QCheckBox(name, body)
+                cb.setChecked(name not in existing)
+                checkboxes.append(cb)
+                body_layout.addWidget(cb)
+            body_layout.addStretch(1)
+            scroll.setWidget(body)
+
+            select_all_btn = QPushButton("全选", selector)
+            clear_btn = QPushButton("全不选", selector)
+            select_new_btn = QPushButton("只选新增", selector)
+
+            def set_checked(predicate: Callable[[QCheckBox], bool]) -> None:
+                for cb in checkboxes:
+                    cb.setChecked(predicate(cb))
+
+            select_all_btn.clicked.connect(lambda: set_checked(lambda _cb: True))
+            clear_btn.clicked.connect(lambda: set_checked(lambda _cb: False))
+            select_new_btn.clicked.connect(lambda: set_checked(lambda cb: cb.text() not in existing))
+
+            actions = QWidget(selector)
+            actions_layout = QHBoxLayout(actions)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            actions_layout.setSpacing(8)
+            actions_layout.addWidget(select_all_btn)
+            actions_layout.addWidget(clear_btn)
+            actions_layout.addWidget(select_new_btn)
+            actions_layout.addStretch(1)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+                selector,
+            )
+            buttons.accepted.connect(selector.accept)
+            buttons.rejected.connect(selector.reject)
+
+            layout = QVBoxLayout(selector)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
+            layout.addWidget(actions)
+            layout.addWidget(scroll, 1)
+            layout.addWidget(buttons)
+            if selector.exec() != QDialog.DialogCode.Accepted:
+                return []
+            return [cb.text() for cb in checkboxes if cb.isChecked()]
 
         save_row_btn.clicked.connect(on_save_row)
+        probe_models_btn.clicked.connect(on_probe_models)
         add_row_btn.clicked.connect(on_add_row)
         delete_btn.clicked.connect(on_delete_row)
 
@@ -2886,6 +3012,7 @@ class SettingsDialog(QDialog):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.addWidget(add_row_btn)
         btn_layout.addWidget(delete_btn)
+        btn_layout.addWidget(probe_models_btn)
         btn_layout.addStretch(1)
 
         edit_form = QFormLayout()
@@ -2917,7 +3044,7 @@ class SettingsDialog(QDialog):
 
         refresh_table()
         if profiles:
-            table.setCurrentCell(0, 0)
+            _select_profile(profiles[0].id)
 
         dialog.exec()
         self._api_profiles = profiles

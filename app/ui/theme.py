@@ -495,7 +495,7 @@ QGroupBox#advancedParamsGroup {{
 QGroupBox#advancedParamsGroup::title {{
     padding: 2px 6px 3px 6px;
 }}
-QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget, QComboBox {{
+QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit, QTableWidget, QComboBox {{
     background: {rgba(theme.input_background_color, 235)};
     border: 1px solid {rgba(theme.border_color, 148)};
     border-radius: 7px;
@@ -547,7 +547,7 @@ QProgressBar::chunk {{
     border-radius: 6px;
     margin: 1px;
 }}
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTextEdit:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTextEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{
     background: {rgba(mix(theme.panel_background_color, "#808080", 0.16), 172)};
     border: 1px solid {rgba(mix(theme.border_color, "#808080", 0.28), 102)};
     color: {rgba(theme.muted_text_color, 138)};
@@ -647,7 +647,7 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
     width: 12px;
     height: 12px;
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus, QComboBox:focus {{
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
     border: 1px solid {rgba(theme.primary_color, 194)};
     background: {theme.input_background_color};
 }}
