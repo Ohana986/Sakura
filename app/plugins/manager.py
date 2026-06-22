@@ -444,6 +444,7 @@ def _build_manifest(plugin: PluginBase, spec: PluginSpec) -> PluginManifest:
     return PluginManifest(
         plugin_id=plugin_id,
         name=spec.name or plugin_id,
+        author=spec.author,
         description=spec.description,
         version=version or "0.0.0",
         api_version=spec.api_version,
@@ -508,6 +509,7 @@ def _build_plugin_context(
     manifest_view = PluginManifestView(
         plugin_id=manifest.plugin_id,
         name=manifest.name,
+        author=manifest.author,
         description=manifest.description,
         version=manifest.version,
         api_version=manifest.api_version,

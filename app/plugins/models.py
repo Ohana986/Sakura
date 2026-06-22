@@ -157,6 +157,7 @@ class PluginManifestView:
     plugin_id: str
     name: str
     version: str
+    author: str = ""
     description: str = ""
     api_version: int = PLUGIN_API_VERSION
     priority: int = 100
@@ -180,6 +181,7 @@ class PluginManifest:
 
     plugin_id: str
     name: str = ""
+    author: str = ""
     description: str = ""
     version: str = "0.0.0"
     api_version: int = PLUGIN_API_VERSION
@@ -200,6 +202,7 @@ class PluginSpec:
     priority: int = 100
     plugin_id: str = ""
     name: str = ""
+    author: str = ""
     description: str = ""
     version: str = "0.0.0"
     api_version: int = PLUGIN_API_VERSION
