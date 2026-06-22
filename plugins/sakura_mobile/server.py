@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.core.mobile_chat_bridge import MobileChatBusyError
 from app.core.debug_log import debug_log
+from app.ui.theme import mix, theme_from_mapping
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -109,6 +110,14 @@ class MobilePluginService:
     def chat(self, character_id: str, text: str, image_data_url: str = "") -> dict[str, Any]:
         return self.mobile_service.chat(character_id, text, image_data_url)
 
+    def theme(self) -> dict[str, object]:
+        theme = getattr(self.mobile_service, "theme", None)
+        if callable(theme):
+            result = theme()
+            if isinstance(result, dict):
+                return result
+        return {}
+
 
 def run_mobile_server(
     base_dir: Path,
@@ -183,7 +192,7 @@ def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPReq
                 self._log_request_start("GET", parsed.path)
                 if parsed.path in {"", "/"}:
                     self._require_token(parsed)
-                    self._send_html(_mobile_html(token))
+                    self._send_html(_mobile_html(token, service.theme()))
                     return
                 if parsed.path == "/api/status":
                     self._require_token(parsed)
@@ -353,48 +362,87 @@ def _write_mobile_access_log(base_dir: Path | None, event: str, data: dict[str, 
         pass
 
 
-def _mobile_html(token: str) -> str:
+def _mobile_theme_variables(theme_data: dict[str, object] | None = None) -> str:
+    theme = theme_from_mapping(theme_data or {})
+    history_panel = mix(theme.page_background_color, "#ffffff", 0.15)
+    assistant_bubble = mix(theme.bubble_background_color, "#ffffff", 0.72)
+    assistant_border = mix(theme.border_color, "#ffffff", 0.18)
+    user_bubble = mix(theme.bubble_background_color, theme.primary_color, 0.13)
+    user_border = mix(theme.border_color, theme.primary_color, 0.18)
+    return "\n".join(
+        [
+            f"      --primary-color: {theme.primary_color};",
+            f"      --primary-hover-color: {theme.primary_hover_color};",
+            f"      --accent-color: {theme.accent_color};",
+            f"      --text-color: {theme.text_color};",
+            f"      --secondary-text-color: {theme.secondary_text_color};",
+            f"      --muted-text-color: {theme.muted_text_color};",
+            f"      --page-background-color: {theme.page_background_color};",
+            f"      --panel-background-color: {theme.panel_background_color};",
+            f"      --input-background-color: {theme.input_background_color};",
+            f"      --bubble-background-color: {theme.bubble_background_color};",
+            f"      --border-color: {theme.border_color};",
+            f"      --history-panel-background-color: {history_panel};",
+            f"      --assistant-bubble-background-color: {assistant_bubble};",
+            f"      --assistant-bubble-border-color: {assistant_border};",
+            f"      --user-bubble-background-color: {user_bubble};",
+            f"      --user-bubble-border-color: {user_border};",
+        ]
+    )
+
+
+def _mobile_html(token: str, theme_data: dict[str, object] | None = None) -> str:
+    theme_variables = _mobile_theme_variables(theme_data)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sakura Mobile</title>
+  <title>手机端聊天</title>
   <style>
-    :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    body {{ margin: 0; background: #f7f4fb; color: #172033; overflow: hidden; }}
-    main {{ height: 100vh; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }}
-    header {{ display: flex; gap: 10px; align-items: center; padding: 12px; background: #b9c4ff; position: sticky; top: 0; }}
-    h1 {{ font-size: 18px; margin: 0; flex: 1; }}
+    :root {{
+{theme_variables}
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    body {{ margin: 0; background: var(--page-background-color); color: var(--text-color); overflow: hidden; }}
+    main {{ box-sizing: border-box; height: 100vh; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 12px; padding: 16px; }}
+    header {{ display: flex; gap: 10px; align-items: center; }}
+    h1 {{ color: var(--secondary-text-color); font-size: 22px; font-weight: 700; margin: 0; flex: 1; }}
     select, button, textarea {{ font: inherit; }}
-    select, textarea {{ border: 1px solid #9facdf; border-radius: 8px; background: white; }}
-    select {{ padding: 8px; max-width: 48vw; }}
-    #chat {{ min-height: 0; padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }}
-    .msg {{ max-width: 82%; padding: 10px 12px; border-radius: 14px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; box-shadow: 0 1px 2px #0001; }}
-    .user {{ align-self: flex-end; background: #c8eef4; }}
-    .assistant {{ align-self: flex-start; background: white; }}
+    select, textarea {{ border: 1px solid var(--border-color); border-radius: 8px; background: var(--input-background-color); color: var(--text-color); }}
+    select {{ padding: 6px 12px; max-width: 48vw; border-radius: 999px; color: var(--muted-text-color); }}
+    #chat {{ min-height: 0; padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; background: var(--history-panel-background-color); border: 1px solid var(--border-color); border-radius: 14px; }}
+    .msg-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
+    .msg-wrap.user-wrap {{ align-items: flex-end; }}
+    .msg-wrap.assistant-wrap {{ align-items: flex-start; }}
+    .msg {{ box-sizing: border-box; width: min(82%, 520px); padding: 12px 14px; border-radius: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }}
+    .user {{ background: var(--user-bubble-background-color); border: 1px solid var(--user-bubble-border-color); }}
+    .assistant {{ background: var(--assistant-bubble-background-color); border: 1px solid var(--assistant-bubble-border-color); }}
     .typing .body {{ display: inline-flex; gap: 4px; align-items: center; min-width: 32px; min-height: 18px; }}
-    .typing-dot {{ width: 6px; height: 6px; border-radius: 50%; background: #7b8097; opacity: .35; animation: typingPulse 1s infinite ease-in-out; }}
+    .typing-dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--muted-text-color); opacity: .35; animation: typingPulse 1s infinite ease-in-out; }}
     .typing-dot:nth-child(2) {{ animation-delay: .16s; }}
     .typing-dot:nth-child(3) {{ animation-delay: .32s; }}
     @keyframes typingPulse {{ 0%, 80%, 100% {{ transform: translateY(0); opacity: .35; }} 40% {{ transform: translateY(-3px); opacity: .95; }} }}
-    .meta {{ font-size: 12px; color: #667; margin-bottom: 4px; }}
-    form {{ display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: end; padding: 12px; background: #e8e6ff; }}
+    .meta {{ box-sizing: border-box; width: min(82%, 520px); color: var(--muted-text-color); font-size: 13px; }}
+    .user-wrap .meta {{ text-align: right; }}
+    form {{ display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: end; }}
     .media-actions {{ display: grid; gap: 6px; }}
-    .media-button {{ display: inline-flex; align-items: center; justify-content: center; min-width: 54px; min-height: 34px; padding: 0 8px; border-radius: 8px; background: #fff; border: 1px solid #9facdf; color: #172033; font-size: 13px; }}
-    .media-button:active {{ background: #eef2ff; }}
-    .media-button.selected {{ border-color: #0095b6; box-shadow: 0 0 0 2px #0095b622; }}
+    .media-button {{ display: inline-flex; align-items: center; justify-content: center; min-width: 54px; min-height: 34px; padding: 0 8px; border-radius: 8px; background: var(--input-background-color); border: 1px solid var(--border-color); color: var(--secondary-text-color); font-size: 13px; }}
+    .media-button:active {{ background: var(--bubble-background-color); }}
+    .media-button.selected {{ border-color: var(--accent-color); outline: 2px solid var(--accent-color); outline-offset: 1px; }}
     .file-input {{ position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }}
     textarea {{ min-height: 42px; max-height: 140px; padding: 10px; resize: vertical; }}
-    button {{ border: 0; border-radius: 8px; background: #0095b6; color: white; padding: 10px 14px; }}
+    button {{ border: 0; border-radius: 8px; background: var(--primary-color); color: white; padding: 10px 14px; }}
+    button:active {{ background: var(--primary-hover-color); }}
     button:disabled {{ opacity: .55; }}
-    #status {{ font-size: 12px; color: #5b6078; padding: 0 12px 8px; background: #e8e6ff; }}
+    #status {{ min-height: 18px; color: var(--muted-text-color); font-size: 12px; padding: 4px 0 0; }}
   </style>
 </head>
 <body>
 <main>
   <header>
-    <h1>Sakura</h1>
+    <h1 id="title">手机端聊天</h1>
     <select id="character" disabled></select>
   </header>
   <section id="chat"></section>
@@ -424,11 +472,14 @@ const albumButton = document.querySelector('#albumButton');
 const cameraButton = document.querySelector('#cameraButton');
 const send = document.querySelector('#send');
 const statusLine = document.querySelector('#status');
+const title = document.querySelector('#title');
 let replyQueueToken = 0;
 let selectedImageSource = '';
+let assistantName = '角色';
 
 function api(path) {{ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }}
 function setStatus(value) {{ statusLine.textContent = value || ''; }}
+function thinkingText() {{ return assistantName + ' 正在思考...'; }}
 function sleep(ms) {{ return new Promise(resolve => setTimeout(resolve, ms)); }}
 async function fetchWithTimeout(url, options = {{}}) {{
   const controller = new AbortController();
@@ -455,6 +506,13 @@ function errorText(err) {{
 function cleanAssistantText(value) {{
   return String(value || '').trim().replace(/^[.．…]+\\s*/, '').trimStart();
 }}
+function formatMetaTime(value) {{
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = number => String(number).padStart(2, '0');
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+    + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+}}
 function scrollChatToBottom() {{
   requestAnimationFrame(() => requestAnimationFrame(() => {{
     chat.scrollTop = chat.scrollHeight;
@@ -463,19 +521,24 @@ function scrollChatToBottom() {{
   }}));
 }}
 function addMessage(role, content, options = {{}}) {{
+  const row = document.createElement('div');
+  row.className = 'msg-wrap ' + role + '-wrap';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const roleName = role === 'user' ? '你' : assistantName;
+  const metaTime = formatMetaTime(options.created_at || options.createdAt);
+  meta.textContent = metaTime ? roleName + ' · ' + metaTime : roleName;
   const node = document.createElement('div');
   node.className = 'msg ' + role;
   if (options.typing) node.className += ' typing';
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  meta.textContent = role === 'user' ? '你' : 'Sakura';
   const body = document.createElement('div');
   body.className = 'body';
   body.textContent = content;
-  node.append(meta, body);
-  chat.append(node);
+  node.append(body);
+  row.append(meta, node);
+  chat.append(row);
   scrollChatToBottom();
-  return node;
+  return row;
 }}
 function addTypingMessage() {{
   const node = addMessage('assistant', '', {{ typing: true }});
@@ -527,6 +590,11 @@ async function loadCharacters() {{
     if (item.current === 'true') opt.selected = true;
     character.append(opt);
   }}
+  const selected = character.selectedOptions[0];
+  assistantName = selected ? selected.textContent.trim() || '角色' : '角色';
+  title.textContent = assistantName;
+  document.title = assistantName + ' · 手机端聊天';
+  text.placeholder = '发消息给' + assistantName + '...';
   await loadHistory();
 }}
 async function loadHistory() {{
@@ -535,7 +603,7 @@ async function loadHistory() {{
   chat.innerHTML = '';
   const data = await fetchJson('/api/history?character_id=' + encodeURIComponent(character.value) + '&limit=50');
   for (const item of data.history || []) {{
-    if (item.role === 'user' || item.role === 'assistant') addMessage(item.role, item.content);
+    if (item.role === 'user' || item.role === 'assistant') addMessage(item.role, item.content, {{ created_at: item.created_at }});
   }}
   scrollChatToBottom();
 }}
@@ -557,7 +625,7 @@ form.addEventListener('submit', async (event) => {{
   const file = selectedImageFile();
   if (!value && !file) return;
   send.disabled = true;
-  setStatus('她正在思考...');
+  setStatus(thinkingText());
   addMessage('user', value + (file ? '\\n（已附加图片）' : ''));
   try {{
     const imageData = await readImage(file);

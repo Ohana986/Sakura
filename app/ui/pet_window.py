@@ -213,6 +213,7 @@ from app.ui.theme import (
     build_app_chrome_stylesheet,
     build_message_box_stylesheet,
     merge_theme_with_character,
+    theme_colors_to_mapping,
 )
 from app.voice import VoicePlaybackController
 
@@ -4525,6 +4526,7 @@ class PetWindow(QWidget):
                 mobile_characters_sink=self._mobile_characters,
                 mobile_history_sink=self._mobile_history,
                 mobile_chat_sink=self._mobile_chat,
+                mobile_theme_sink=self._mobile_theme,
             )
         except Exception as exc:  # noqa: BLE001 — 装配失败不得阻断启动
             debug_log("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
@@ -4537,6 +4539,9 @@ class PetWindow(QWidget):
 
     def _mobile_chat(self, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
         return self.mobile_chat_bridge.chat(character_id, text, image_data_url)
+
+    def _mobile_theme(self) -> dict[str, object]:
+        return theme_colors_to_mapping(getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS))
 
     def mobile_context_providers(self, _profile: CharacterProfile) -> list[Any]:
         return list(getattr(self.plugin_manager, "context_providers", []))

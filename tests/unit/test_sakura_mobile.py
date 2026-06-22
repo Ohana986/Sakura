@@ -17,6 +17,7 @@ from app.config.character_loader import CharacterProfile
 from app.core.mobile_chat_bridge import MobileChatBridge, MobileChatBusyError
 from app.llm.chat_reply import ChatReply, ChatSegment
 from app.storage.chat_history import ChatHistoryEntry
+from app.ui.theme import ThemeSettings, theme_colors_to_mapping
 from plugins.sakura_mobile import server as mobile_server
 
 
@@ -49,6 +50,48 @@ def test_mobile_page_scrolls_to_bottom_after_history_load() -> None:
     assert "page.scrollTop = page.scrollHeight" in html
     assert "function scrollChatToBottom()" in html
     assert "scrollChatToBottom();" in html[html.index("async function loadHistory()") : html.index("function readImage")]
+
+
+def test_mobile_page_writes_theme_variables() -> None:
+    theme = ThemeSettings(
+        primary_color="#112233",
+        primary_hover_color="#223344",
+        accent_color="#334455",
+        text_color="#445566",
+        secondary_text_color="#556677",
+        muted_text_color="#667788",
+        page_background_color="#778899",
+        panel_background_color="#8899aa",
+        input_background_color="#99aabb",
+        bubble_background_color="#aabbcc",
+        border_color="#bbccdd",
+    )
+
+    html = mobile_server._mobile_html("secret", theme_colors_to_mapping(theme))
+
+    assert "--primary-color: #112233;" in html
+    assert "--page-background-color: #778899;" in html
+    assert "--panel-background-color: #8899aa;" in html
+    assert "--input-background-color: #99aabb;" in html
+    assert "--bubble-background-color: #aabbcc;" in html
+    assert "--border-color: #bbccdd;" in html
+    assert "background: var(--page-background-color); color: var(--text-color);" in html
+    assert "background: var(--history-panel-background-color);" in html
+    assert "background: var(--assistant-bubble-background-color);" in html
+    assert "background: var(--user-bubble-background-color);" in html
+    assert "button { border: 0; border-radius: 8px; background: var(--primary-color);" in html
+
+
+def test_mobile_page_uses_current_character_name_for_labels() -> None:
+    html = mobile_server._mobile_html("secret")
+
+    assert '<h1 id="title">手机端聊天</h1>' in html
+    assert "let assistantName = '角色';" in html
+    assert "title.textContent = assistantName;" in html
+    assert "role === 'user' ? '你' : assistantName" in html
+    assert "function thinkingText() { return assistantName + ' 正在思考...'; }" in html
+    assert "她正在思考" not in html
+    assert "meta.textContent = role === 'user' ? '你' : 'Sakura';" not in html
 
 
 def test_mobile_chat_busy_returns_409() -> None:
