@@ -60,7 +60,7 @@ from app.config.models import (
     MODEL_SLOT_CHAT,
     MODEL_SLOT_DESCRIPTIONS,
     MODEL_SLOT_LABELS,
-    MODEL_SLOT_ORDER,
+    MODEL_SLOT_UI_ORDER,
     MODEL_SLOT_VISION_CHAT,
     ApiConfigProfile,
     ModelSelectionSettings,
@@ -461,7 +461,7 @@ class ApiSettingsPage:
         owner._slot_inherit_checks = {}
         owner._slot_test_buttons = {}
         owner._slot_probe_buttons = {}
-        for slot in MODEL_SLOT_ORDER:
+        for slot in MODEL_SLOT_UI_ORDER:
             row = self._build_slot_row(slot, slot_group)
             slot_form.addRow(MODEL_SLOT_LABELS[slot], row)
         slot_group.setLayout(slot_form)
