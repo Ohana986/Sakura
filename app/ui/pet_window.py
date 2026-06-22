@@ -4611,6 +4611,7 @@ class PetWindow(QWidget):
     def _finish_mobile_chat_worker(self) -> None:
         self._active_mobile_chat_request = None
         self._start_next_mobile_chat()
+        self._update_reply_history_buttons()
 
     def _request_fill_input_text(self, text: str) -> None:
         """插件侧入口：请求把文本填入输入框。

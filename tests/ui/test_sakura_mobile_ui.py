@@ -115,6 +115,43 @@ def test_mobile_chat_completion_syncs_current_desktop_context() -> None:
     assert window.history_window.refreshes == 1
 
 
+def test_mobile_chat_finish_refreshes_reply_history_buttons() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _finish_mobile_chat_worker = PetWindow._finish_mobile_chat_worker
+        _normalized_reply_history_index = PetWindow._normalized_reply_history_index
+        _can_review_reply_history = PetWindow._can_review_reply_history
+        _update_reply_history_buttons = PetWindow._update_reply_history_buttons
+
+        def _start_next_mobile_chat(self) -> None:
+            self.start_next_called = True
+
+    class Button:
+        def __init__(self) -> None:
+            self.enabled = False
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    window = MinimalWindow()
+    window.start_next_called = False
+    window._active_mobile_chat_request = {"done": True}
+    window.worker_thread = None
+    window.reply_history_segments = [ChatSegment("旧回复。"), ChatSegment("手机回复。")]
+    window.reply_history_index = 0
+    window.subtitle_controller = SimpleNamespace(is_reply_sequence_active=lambda: False)
+    window.reply_history_previous_button = Button()
+    window.reply_history_next_button = Button()
+
+    window._finish_mobile_chat_worker()
+
+    assert window._active_mobile_chat_request is None
+    assert window.start_next_called
+    assert not window.reply_history_previous_button.enabled
+    assert window.reply_history_next_button.enabled
+
+
 def test_mobile_chat_completion_ignores_other_character() -> None:
     from app.ui.pet_window import PetWindow
 
