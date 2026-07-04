@@ -14,7 +14,7 @@ from enum import Enum
 
 from PySide6.QtCore import QObject, Signal
 
-from app.core.debug_log import debug_log
+from app.core.runtime_log import log_event
 
 
 class PetUiState(str, Enum):
@@ -41,13 +41,7 @@ class PetUiStateStore(QObject):
     def set_state(self, new_state: PetUiState, reason: str = "") -> None:
         if new_state == self._state:
             return
-        old_state = self._state
         self._state = new_state
-        debug_log(
-            "UI",
-            "ui.state",
-            {"from": old_state.value, "to": new_state.value, "reason": reason},
-        )
         self.state_changed.emit(new_state)
 
     # ---- 语义化转移入口：调用点表达意图而不是状态值 ----

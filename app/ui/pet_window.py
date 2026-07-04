@@ -87,7 +87,8 @@ from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply_result
 from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
-from app.core.debug_log import debug_log, summarize_messages
+from app.core.retry_policy import MAX_AUTO_RETRY_ATTEMPTS
+from app.core.runtime_log import log_event, summarize_messages
 from app.config.settings_service import BackchannelSettings, BubbleSettings, StartupSettings
 from app.backchannel.audio_cache import BackchannelAudioCache, voice_fingerprint
 from app.backchannel.classifier import RuleClassifier
@@ -238,6 +239,35 @@ SCREEN_AWARENESS_RECENT_CONVERSATION_SUMMARY_HINT = (
     "刚刚说过什么；不要逐字复述，应结合屏幕变化找话题，并避免连续重复同一类话题或休息提醒。"
 )
 SCREEN_AWARENESS_EVENT_TYPE = "screen_awareness_check"
+INTERACTION_STAGE_EVENT = "agent.interaction.stage"
+_INTERACTION_STAGE_LABELS = {
+    "send_message_ignored": "发送被忽略",
+    "request_messages_ready": "请求上下文已准备",
+    "chat_worker_started": "聊天 Worker 已启动",
+    "agent_progress_received": "收到 Agent 中间回复",
+    "agent_result_received": "收到 Agent 回复",
+    "screen_observation_followup_queued": "屏幕观察追问已排队",
+    "screen_observation_missing_user_message": "屏幕观察缺少关联消息",
+    "screen_observation_failed": "屏幕观察失败",
+    "event_screen_observation_failed": "主动事件屏幕观察失败",
+    "screen_observation_worker_restart": "屏幕观察 Worker 重启",
+    "event_screen_observation_worker_restart": "主动事件屏幕观察 Worker 重启",
+    "confirm_action": "确认执行动作",
+    "cancel_action": "取消待确认动作",
+    "action_worker_start": "动作 Worker 准备启动",
+    "action_result_received": "收到动作执行回复",
+    "event_worker_started": "主动事件 Worker 已启动",
+    "event_result_received": "收到主动事件回复",
+    "event_silent": "主动事件无回复",
+    "event_error": "主动事件失败",
+    "worker_error": "Worker 失败",
+    "tts_speak_requested": "请求即时 TTS",
+    "tts_prepared_speak_requested": "请求播放预生成 TTS",
+    "next_segment_tts_prepare_requested": "请求预生成下一段 TTS",
+    "tts_skipped_language_guard": "语言守卫跳过 TTS",
+    "tts_error_visible": "TTS 错误已显示",
+    "interaction_finished": "交互结束",
+}
 LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
 SCREEN_AWARENESS_STATE_FILE = "screen_awareness_state.json"
@@ -384,31 +414,31 @@ class TTSReadyWarmupWorker(QObject):
             ensure_ready = getattr(self.provider, "ensure_ready", None)
             if not callable(ensure_ready):
                 return
-            debug_log("TTS", "开始后台预热 TTS 服务", {"provider": type(self.provider).__name__})
+            log_event("TTS", "开始后台预热 TTS 服务", {"provider": type(self.provider).__name__})
             ok, message = ensure_ready()
             self._cancel_token.throw_if_cancelled()
             if ok:
-                debug_log(
+                log_event(
                     "TTS",
                     "后台预热 TTS 服务完成",
                     {"provider": type(self.provider).__name__, "message": message},
                 )
                 self.succeeded.emit(message)
             else:
-                debug_log(
+                log_event(
                     "TTS",
                     "后台预热 TTS 服务失败",
                     {"provider": type(self.provider).__name__, "message": message},
                 )
                 self.failed.emit(message)
         except OperationCancelled:
-            debug_log("TTS", "后台预热 TTS 服务已取消", {"provider": type(self.provider).__name__})
+            log_event("TTS", "后台预热 TTS 服务已取消", {"provider": type(self.provider).__name__})
         except Exception as exc:  # noqa: BLE001
             if self._cancel_token.is_cancelled():
-                debug_log("TTS", "后台预热 TTS 服务已取消", {"provider": type(self.provider).__name__})
+                log_event("TTS", "后台预热 TTS 服务已取消", {"provider": type(self.provider).__name__})
                 return
             message = f"TTS 服务预热失败：{exc}"
-            debug_log(
+            log_event(
                 "TTS",
                 "后台预热 TTS 服务异常",
                 {"provider": type(self.provider).__name__, "error": str(exc)},
@@ -552,6 +582,8 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        self._auto_memory_curation_failure_attempts = 0
+        self._suppress_auto_memory_curation_restart = False
         self.drag_anchor: QPoint | None = None
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
@@ -634,7 +666,7 @@ class PetWindow(QWidget):
             self.reminder_timer.start()
             self._sync_screen_awareness_timer()
             QTimer.singleShot(0, self._maybe_start_memory_backfill)
-        debug_log(
+        log_event(
             "PetWindow",
             "窗口运行状态初始化",
             {
@@ -1118,14 +1150,14 @@ class PetWindow(QWidget):
                     self._set_portrait_overlay_suppressed(True)
                 self._sync_renderer_overlay_geometry(manager=manager)
                 manager.show()
-                debug_log(
+                log_event(
                     "RendererManager",
                     "已启用独立角色渲染窗口",
                     {"renderer": manager.active_renderer_name},
                 )
             return manager
         except Exception as exc:  # noqa: BLE001 — 渲染后端初始化失败不得影响桌宠启动
-            debug_log("RendererManager", "初始化失败，回退现有显示", {"error": str(exc)})
+            log_event("RendererManager", "初始化失败，回退现有显示", {"error": str(exc)})
             return None
 
     def _activate_renderer_manager(self) -> Any:
@@ -1144,7 +1176,7 @@ class PetWindow(QWidget):
         try:
             manager.close()
         except Exception as exc:  # noqa: BLE001
-            debug_log("RendererManager", "关闭失败", {"error": str(exc)})
+            log_event("RendererManager", "关闭失败", {"error": str(exc)})
         finally:
             self.renderer_manager = None
             self._set_portrait_overlay_suppressed(False)
@@ -1226,7 +1258,7 @@ class PetWindow(QWidget):
             self._gaze_last = (nx, ny)
             manager.look_at(nx, ny)
         except Exception as exc:  # noqa: BLE001 — 视线追踪异常不得影响主窗口
-            debug_log("RendererManager", "视线追踪更新失败", {"error": str(exc)})
+            log_event("RendererManager", "视线追踪更新失败", {"error": str(exc)})
 
     def _sync_renderer_overlay_geometry(
         self,
@@ -1245,7 +1277,7 @@ class PetWindow(QWidget):
             manager.set_geometry(top_left.x(), top_left.y(), pw, ph)
             manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
         except Exception as exc:  # noqa: BLE001 — 渲染后端异常不得影响主窗口
-            debug_log("RendererManager", "同步渲染窗口几何失败", {"error": str(exc)})
+            log_event("RendererManager", "同步渲染窗口几何失败", {"error": str(exc)})
 
     def _set_portrait_overlay_suppressed(self, suppressed: bool) -> None:
         """独立渲染器接管角色显示时隐藏原 PNG 立绘。"""
@@ -1363,7 +1395,7 @@ class PetWindow(QWidget):
         try:
             emit_event(event_type, payload or {}, source=source)
         except Exception as exc:  # noqa: BLE001
-            debug_log(
+            log_event(
                 "PluginManager",
                 "插件事件派发失败",
                 {"event_type": event_type, "error": str(exc)},
@@ -1382,7 +1414,7 @@ class PetWindow(QWidget):
         try:
             emit_bus(event_name, payload or {})
         except Exception as exc:  # noqa: BLE001
-            debug_log(
+            log_event(
                 "PluginEventBus",
                 "插件总线事件派发失败",
                 {"event": event_name, "error": str(exc)},
@@ -1436,7 +1468,7 @@ class PetWindow(QWidget):
             try:
                 close()
             except Exception as exc:  # noqa: BLE001
-                debug_log(
+                log_event(
                     "TTS",
                     "关闭 TTS Provider 失败",
                     {"provider": type(provider).__name__, "error": str(exc)},
@@ -1652,9 +1684,9 @@ class PetWindow(QWidget):
                 try:
                     discard_prepared(handle)
                 except Exception as exc:  # noqa: BLE001
-                    debug_log("Backchannel", "让位丢弃接话预生成失败", {"error": str(exc)})
+                    log_event("Backchannel", "让位丢弃接话预生成失败", {"error": str(exc)})
         if removed:
-            debug_log(
+            log_event(
                 "Backchannel",
                 "回复开始,未就绪的接话合成请求已让位",
                 {"removed": removed, "kept_ready": len(prepared)},
@@ -1675,7 +1707,7 @@ class PetWindow(QWidget):
         try:
             manifest = load_backchannel_manifest(path, profile=profile)
         except BackchannelManifestError as exc:
-            debug_log("Backchannel", "接话清单加载失败,功能停用", {"error": str(exc)})
+            log_event("Backchannel", "接话清单加载失败,功能停用", {"error": str(exc)})
             controller.set_manifest(None)
             return
         self.backchannel_manifest = manifest if manifest else None
@@ -1770,7 +1802,7 @@ class PetWindow(QWidget):
                     try:
                         discard_prepared(handle)
                     except Exception as exc:  # noqa: BLE001
-                        debug_log("Backchannel", "落盘后丢弃合成句柄失败", {"error": str(exc)})
+                        log_event("Backchannel", "落盘后丢弃合成句柄失败", {"error": str(exc)})
         provider = self.tts_provider
         queued = 0
         missing_audio = 0
@@ -1791,7 +1823,7 @@ class PetWindow(QWidget):
                     prepared[key] = provider.prepare(variant.ja, template.tone)
                     queued += 1
                 except Exception as exc:  # noqa: BLE001
-                    debug_log(
+                    log_event(
                         "Backchannel",
                         "接话音频预生成请求失败",
                         {
@@ -1802,7 +1834,7 @@ class PetWindow(QWidget):
                         },
                     )
         if missing_audio:
-            debug_log(
+            log_event(
                 "Backchannel",
                 "接话清单存在缺失音频,已提交运行期预生成",
                 {
@@ -1844,7 +1876,7 @@ class PetWindow(QWidget):
             shutil.copyfile(source, temp_path)
             return temp_path
         except Exception as exc:  # noqa: BLE001
-            debug_log(
+            log_event(
                 "Backchannel",
                 "接话预置音频复制失败",
                 {"audio_path": str(source), "error": str(exc)},
@@ -1897,7 +1929,7 @@ class PetWindow(QWidget):
         # 分段的合成(及由其 on_started 驱动的字幕)整体延后。
         # 补合成统一安排在空闲时机(回复完成/预热成功/清单加载)。
         if handle is None or handle.audio_path is None or handle.failed:
-            debug_log(
+            log_event(
                 "Backchannel",
                 "接话音频尚未预生成完成,本次仅显示字幕",
                 {"template": choice.template.id, "text": choice.variant.ja},
@@ -1927,7 +1959,7 @@ class PetWindow(QWidget):
             )
         except Exception as exc:  # noqa: BLE001
             self._active_backchannel_audio = None
-            debug_log(
+            log_event(
                 "Backchannel",
                 "接话音频播放请求失败",
                 {"template": choice.template.id, "error": str(exc)},
@@ -1959,7 +1991,7 @@ class PetWindow(QWidget):
         try:
             discard_prepared(handle)
         except Exception as exc:  # noqa: BLE001
-            debug_log("Backchannel", "取消接话音频失败", {"error": str(exc)})
+            log_event("Backchannel", "取消接话音频失败", {"error": str(exc)})
 
     def _discard_backchannel_audio_cache(self) -> None:
         self._discard_active_backchannel_audio()
@@ -1973,7 +2005,7 @@ class PetWindow(QWidget):
                 if callable(discard_prepared):
                     discard_prepared(handle)
             except Exception as exc:  # noqa: BLE001
-                debug_log("Backchannel", "丢弃接话预生成音频失败", {"error": str(exc)})
+                log_event("Backchannel", "丢弃接话预生成音频失败", {"error": str(exc)})
         prepared.clear()
 
     @Slot(object)
@@ -2001,7 +2033,7 @@ class PetWindow(QWidget):
         if subtitle_controller is None or not subtitle_controller.is_reply_sequence_active():
             self.ui_state.finish("speaking_timeout")
             return
-        debug_log(
+        log_event(
             "PetWindow",
             "SPEAKING 状态超时，强制结束当前回复",
             {"timeout_ms": SPEAKING_STATE_TIMEOUT_MS},
@@ -2091,8 +2123,8 @@ class PetWindow(QWidget):
         try:
             entries = self.history_store.load()
         except OSError as exc:
-            debug_log("History", "回溯历史读取失败", {"error": str(exc)})
-            debug_log("History", "回溯历史读取失败", {"error": str(exc)})
+            log_event("History", "回溯历史读取失败", {"error": str(exc)})
+            log_event("History", "回溯历史读取失败", {"error": str(exc)})
             entries = []
         self.reply_history_segments = _reply_history_segments_from_entries(entries)
         self.reply_history_index = (
@@ -2403,7 +2435,7 @@ class PetWindow(QWidget):
                     region = region.united(QRegion(child.geometry()))
             self.setMask(region)
         except Exception as exc:  # noqa: BLE001
-            debug_log("UI", "舞台碰撞遮罩更新失败,清除遮罩降级", {"error": str(exc)})
+            log_event("UI", "舞台碰撞遮罩更新失败,清除遮罩降级", {"error": str(exc)})
             self.clearMask()
 
     def _apply_stage_debug_overlay(self, enabled: bool, *, refresh: bool = False) -> None:
@@ -2478,7 +2510,7 @@ class PetWindow(QWidget):
             if blurred is not None and not blurred.isNull():
                 background.set_blurred_pixmap(blurred)
         except Exception as exc:  # noqa: BLE001
-            debug_log("UI", "输入栏软件模糊背景刷新失败", {"error": str(exc)})
+            log_event("UI", "输入栏软件模糊背景刷新失败", {"error": str(exc)})
 
     def _build_blurred_background(self, global_rect: QRect) -> QPixmap | None:
         """截取虚拟桌面，裁出 global_rect（逻辑全局坐标）对应区域并做高斯模糊。
@@ -2494,18 +2526,7 @@ class PetWindow(QWidget):
         cropped = crop_logical_region(desktop_pixmap, virtual_geometry, global_rect)
         if cropped.isNull():
             return None
-        debug_log(
-            "UI",
-            "输入栏模糊背景裁剪",
-            {
-                "global_rect": f"{global_rect.x()},{global_rect.y()} {global_rect.width()}x{global_rect.height()}",
-                "virtual_geometry": f"{virtual_geometry.x()},{virtual_geometry.y()} {virtual_geometry.width()}x{virtual_geometry.height()}",
-                "desktop_px": f"{desktop_pixmap.width()}x{desktop_pixmap.height()}",
-                "dpr": f"{desktop_pixmap.devicePixelRatio():.2f}",
-                "cropped_px": f"{cropped.width()}x{cropped.height()}",
-            },
-        )
-        # 模糊力度：radius 作用在降采样后的小图上，downscale 越大放大回来越糊。
+        # 模糊背景裁剪：用降采样再放大实现毛玻璃效果。
         return make_blurred_pixmap(cropped, radius=4.0, downscale=2)
 
     def _cursor_in_pet_region(self) -> bool:
@@ -2647,10 +2668,10 @@ class PetWindow(QWidget):
         self.active_interaction_id = f"interaction-{self.interaction_sequence}"
         self.active_interaction_started_at = now
         self.active_interaction_last_at = now
-        # UI 线程后续的 debug_log 自动带上交互 ID；worker/TTS 线程由各自入口恢复
+        # UI 线程后续的 log_event 自动带上交互 ID；worker/TTS 线程由各自入口恢复
         set_interaction_id(self.active_interaction_id)
         self.ui_state.begin_thinking(source)
-        debug_log(
+        log_event(
             "Latency",
             "输入事件开始",
             {
@@ -2663,21 +2684,12 @@ class PetWindow(QWidget):
 
     def _log_input_key_event(self, event: object) -> None:
         self._mark_user_activity()
-        key_event = event if isinstance(event, QKeyEvent) else None
-        debug_log(
-            "Input",
-            "输入框按键事件",
-            {
-                "key": int(key_event.key()) if key_event is not None else "",
-                "text": key_event.text() if key_event is not None else "",
-                "modifiers": str(key_event.modifiers()) if key_event is not None else "",
-                "input_chars": len(self.input_edit.text()),
-                "worker_busy": self.worker_thread is not None,
-            },
-        )
 
     def _log_interaction_stage(self, stage: str, data: dict[str, Any] | None = None) -> None:
         if not self.active_interaction_id or self.active_interaction_started_at is None:
+            return
+        stage_label = _INTERACTION_STAGE_LABELS.get(stage)
+        if stage_label is None:
             return
         now = time.perf_counter()
         previous = self.active_interaction_last_at or self.active_interaction_started_at
@@ -2685,12 +2697,14 @@ class PetWindow(QWidget):
         payload: dict[str, Any] = {
             "interaction_id": self.active_interaction_id,
             "stage": stage,
+            "stage_label": stage_label,
             "elapsed_ms": int((now - self.active_interaction_started_at) * 1000),
             "delta_ms": int((now - previous) * 1000),
         }
         if data:
-            payload.update(data)
-        debug_log("Latency", "交互阶段", payload)
+            for key, value in data.items():
+                payload["detail_stage" if key == "stage" else key] = value
+        log_event("Latency", "交互阶段", payload, event=INTERACTION_STAGE_EVENT)
 
     def _end_interaction(self, outcome: str) -> None:
         self._log_interaction_stage("interaction_finished", {"outcome": outcome})
@@ -2745,7 +2759,7 @@ class PetWindow(QWidget):
             show_themed_information(self, "截图已关闭", "请先在设置中开启屏幕观察权限。")
             return
 
-        debug_log("PetWindow", "开始手动框选截图")
+        log_event("PetWindow", "开始手动框选截图")
         QTimer.singleShot(120, self._show_manual_screenshot_overlay)
 
     def _show_manual_screenshot_overlay(self) -> None:
@@ -2761,7 +2775,7 @@ class PetWindow(QWidget):
                     exc,
                 ),
             )
-            debug_log("PetWindow", "手动框选截图启动失败", {"error": str(exc)})
+            log_event("PetWindow", "手动框选截图启动失败", {"error": str(exc)})
             return
 
         overlay = ManualScreenshotOverlay(desktop_pixmap, virtual_geometry)
@@ -2805,7 +2819,7 @@ class PetWindow(QWidget):
     def _finish_manual_screen_observation(self, observation: ScreenObservation) -> None:
         self.pending_manual_screen_observation = observation
         self._update_manual_screenshot_button()
-        debug_log(
+        log_event(
             "PetWindow",
             "手动框选截图已附加到下一条消息",
             {
@@ -2821,7 +2835,7 @@ class PetWindow(QWidget):
     def _handle_manual_screenshot_cancelled(self) -> None:
         self.show()
         self.raise_()
-        debug_log("PetWindow", "手动框选截图已取消")
+        log_event("PetWindow", "手动框选截图已取消")
 
     @Slot()
     def _clear_manual_screenshot_overlay_ref(self) -> None:
@@ -2832,7 +2846,7 @@ class PetWindow(QWidget):
             return
         self.pending_manual_screen_observation = None
         self._update_manual_screenshot_button()
-        debug_log("PetWindow", "待发送手动截图已清除")
+        log_event("PetWindow", "待发送手动截图已清除")
 
     def _update_manual_screenshot_button(self) -> None:
         attached = self.pending_manual_screen_observation is not None
@@ -2863,7 +2877,7 @@ class PetWindow(QWidget):
             },
         )
         if (not text and manual_observation is None) or self.worker_thread is not None:
-            debug_log(
+            log_event(
                 "PetWindow",
                 "发送消息被忽略",
                 {
@@ -2939,7 +2953,7 @@ class PetWindow(QWidget):
                 runtime_event_queue.drain(),
             )
         request_messages = trim_messages_for_model(request_messages)
-        debug_log(
+        log_event(
             "PetWindow",
             "用户消息入队",
             {
@@ -2998,7 +3012,7 @@ class PetWindow(QWidget):
         self.pending_visual_observation_jobs = []
         self._set_busy(True)
         self._log_interaction_stage("ui_busy_enabled")
-        debug_log(
+        log_event(
             "PetWindow",
             "启动聊天 Worker",
             {
@@ -3045,7 +3059,7 @@ class PetWindow(QWidget):
                 "metadata": progress.metadata,
             },
         )
-        debug_log(
+        log_event(
             "PetWindow",
             "收到 Agent 中间回复",
             {
@@ -3079,7 +3093,7 @@ class PetWindow(QWidget):
                 "actions": [action.type for action in result.actions],
             },
         )
-        debug_log(
+        log_event(
             "PetWindow",
             "收到 Agent 回复",
             {
@@ -3131,7 +3145,7 @@ class PetWindow(QWidget):
                     "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
                 },
             )
-            debug_log(
+            log_event(
                 "PetWindow",
                 "屏幕观察请求被禁用",
                 {
@@ -3145,7 +3159,7 @@ class PetWindow(QWidget):
         user_message_index = _last_user_message_index(self.messages)
         if user_message_index is None:
             self._log_interaction_stage("screen_observation_missing_user_message")
-            debug_log("PetWindow", "屏幕观察缺少可关联用户消息")
+            log_event("PetWindow", "屏幕观察缺少可关联用户消息")
             self._consume_agent_result(_build_screen_observation_failed_result("缺少可关联的用户消息。"))
             return True
 
@@ -3156,7 +3170,7 @@ class PetWindow(QWidget):
         except RuntimeError as exc:
             self.screen_observation_followup_in_progress = False
             self._log_interaction_stage("screen_observation_failed", {"error": str(exc)})
-            debug_log("PetWindow", "屏幕观察失败", {"error": str(exc)})
+            log_event("PetWindow", "屏幕观察失败", {"error": str(exc)})
             self._consume_agent_result(_build_screen_observation_failed_result(str(exc)))
             return True
         if not self._start_screen_observation_encode(
@@ -3207,7 +3221,7 @@ class PetWindow(QWidget):
             [*self.messages[:user_message_index], observed_message]
         )
         self.screen_observation_followup_in_progress = False
-        debug_log(
+        log_event(
             "PetWindow",
             "屏幕观察 follow-up 已排队",
             {
@@ -3267,7 +3281,7 @@ class PetWindow(QWidget):
         except RuntimeError as exc:
             self.screen_observation_followup_in_progress = False
             self._log_interaction_stage("event_screen_observation_failed", {"error": str(exc)})
-            debug_log("PetWindow", "主动事件屏幕观察失败", {"error": str(exc)})
+            log_event("PetWindow", "主动事件屏幕观察失败", {"error": str(exc)})
             self._consume_agent_result(_build_screen_observation_failed_result(str(exc)))
             return True
         if not self._start_screen_observation_encode(
@@ -3323,7 +3337,7 @@ class PetWindow(QWidget):
             ),
         ]
         self._record_history("system", append_observation_marker("", observation, visual_id).strip())
-        debug_log(
+        log_event(
             "PetWindow",
             "主动事件屏幕观察 follow-up 已排队",
             {
@@ -3400,17 +3414,17 @@ class PetWindow(QWidget):
         if kind == "chat_followup":
             self.screen_observation_followup_in_progress = False
             self._log_interaction_stage("screen_observation_failed", {"error": message})
-            debug_log("PetWindow", "屏幕观察失败", {"error": message})
+            log_event("PetWindow", "屏幕观察失败", {"error": message})
             self._consume_agent_result(_build_screen_observation_failed_result(message))
             self._resume_screen_observation_followup_cleanup()
         elif kind == "event_followup":
             self.screen_observation_followup_in_progress = False
             self._log_interaction_stage("event_screen_observation_failed", {"error": message})
-            debug_log("PetWindow", "主动事件屏幕观察失败", {"error": message})
+            log_event("PetWindow", "主动事件屏幕观察失败", {"error": message})
             self._consume_agent_result(_build_screen_observation_failed_result(message))
             self._resume_screen_observation_followup_cleanup()
         elif kind in {"screen_awareness_context", "proactive_context"}:
-            debug_log("ScreenAwareness", "主动屏幕上下文编码失败", {"error": message})
+            log_event("ScreenAwareness", "主动屏幕上下文编码失败", {"error": message})
         elif kind == "manual":
             show_themed_warning(
                 self,
@@ -3421,7 +3435,7 @@ class PetWindow(QWidget):
                     message,
                 ),
             )
-            debug_log("PetWindow", "手动框选截图编码失败", {"error": message})
+            log_event("PetWindow", "手动框选截图编码失败", {"error": message})
 
     @Slot(object)
     def _handle_screen_observation_encode_cancelled(self, context: dict[str, Any]) -> None:
@@ -3558,7 +3572,7 @@ class PetWindow(QWidget):
             try:
                 self._set_pending_tool_action(PendingToolAction.from_dict(action.payload))
             except ValueError as exc:
-                debug_log("Tool", "待确认动作无效", {"error": str(exc)})
+                log_event("Tool", "待确认动作无效", {"error": str(exc)})
             return
         self._set_pending_tool_action(None)
 
@@ -3569,15 +3583,16 @@ class PetWindow(QWidget):
         if hasattr(self, "input_bar_animator"):
             self.input_bar_animator.sync()
         panel_state = self.tool_confirmation_panel.state_snapshot()
-        debug_log(
-            "PetWindow",
-            "待确认动作 UI 状态已更新",
-            {
-                "has_action": has_action,
-                "tool_name": action.tool_name if action is not None else "",
-                **panel_state,
-            },
-        )
+        if has_action:
+            log_event(
+                "PetWindow",
+                "待确认动作 UI 状态已更新",
+                {
+                    "has_action": True,
+                    "tool_name": action.tool_name,
+                    **panel_state,
+                },
+            )
 
     def _clear_queued_reply_segments_for_action_resolution(self) -> None:
         self.subtitle_controller.clear_queued_reply_segments_for_action_resolution()
@@ -3658,7 +3673,7 @@ class PetWindow(QWidget):
         try:
             captured = capture_screen_image(self)
         except RuntimeError as exc:
-            debug_log("ScreenAwareness", "主动屏幕上下文获取失败", {"error": str(exc)})
+            log_event("ScreenAwareness", "主动屏幕上下文获取失败", {"error": str(exc)})
             return
         if not self._start_screen_observation_encode(
             captured,
@@ -3668,7 +3683,7 @@ class PetWindow(QWidget):
                 **self._screen_awareness_encode_options(),
             },
         ):
-            debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
+            log_event("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
 
     def _finish_screen_awareness_context(
@@ -3694,17 +3709,24 @@ class PetWindow(QWidget):
         while len(self.screen_awareness_contexts) > batch_limit:
             self.screen_awareness_contexts.pop(0)
             self.screen_awareness_context_dropped_count += 1
-        debug_log(
+        batch_count = len(self.screen_awareness_contexts)
+        screen_name = observation.screen_name or "screen"
+        resolution = f"{observation.width}x{observation.height}"
+        log_event(
             "ScreenAwareness",
             "主动屏幕上下文已缓存",
             {
+                "screen": f"{screen_name} {resolution}",
+                "screen_name": screen_name,
+                "resolution": resolution,
                 "width": observation.width,
                 "height": observation.height,
                 "captured_at": observation.captured_at,
-                "screen_name": observation.screen_name,
-                "batch_count": len(self.screen_awareness_contexts),
+                "batch": f"{batch_count}/{batch_limit}",
+                "batch_count": batch_count,
+                "batch_limit": batch_limit,
                 "dropped_count": self.screen_awareness_context_dropped_count,
-                "image": observation.data_url,
+                "image_chars": len(observation.data_url),
             },
         )
 
@@ -3740,7 +3762,7 @@ class PetWindow(QWidget):
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
             payload["screen_context_window_ended_at"] = screen_contexts[-1].get("captured_at", "")
-            debug_log(
+            log_event(
                 "ScreenAwareness",
                 "主动屏幕上下文批次已附加",
                 {
@@ -3776,7 +3798,7 @@ class PetWindow(QWidget):
         self.last_screen_awareness_context_at = None
         self.screen_awareness_context_dropped_count = 0
         if had_batch:
-            debug_log("ScreenAwareness", "主动屏幕上下文批次已清空", {"reason": reason})
+            log_event("ScreenAwareness", "主动屏幕上下文批次已清空", {"reason": reason})
 
     # 兼容旧方法名；新代码请使用 screen_awareness 命名。
     def _check_proactive_care(self) -> None:
@@ -3848,7 +3870,7 @@ class PetWindow(QWidget):
         try:
             captured = capture_screen_image(self)
         except RuntimeError as exc:
-            debug_log("ScreenAwareness", "主动屏幕上下文获取失败", {"error": str(exc)})
+            log_event("ScreenAwareness", "主动屏幕上下文获取失败", {"error": str(exc)})
             return
         if not self._start_screen_observation_encode(
             captured,
@@ -3858,7 +3880,7 @@ class PetWindow(QWidget):
                 **self._screen_awareness_encode_options(),
             },
         ):
-            debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
+            log_event("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
 
     def _finish_proactive_screen_context(
@@ -3887,17 +3909,24 @@ class PetWindow(QWidget):
         while len(self.proactive_screen_contexts) > batch_limit:
             self.proactive_screen_contexts.pop(0)
             self.proactive_screen_context_dropped_count += 1
-        debug_log(
+        batch_count = len(self.proactive_screen_contexts)
+        screen_name = observation.screen_name or "screen"
+        resolution = f"{observation.width}x{observation.height}"
+        log_event(
             "ScreenAwareness",
             "主动屏幕上下文已缓存",
             {
+                "screen": f"{screen_name} {resolution}",
+                "screen_name": screen_name,
+                "resolution": resolution,
                 "width": observation.width,
                 "height": observation.height,
                 "captured_at": observation.captured_at,
-                "screen_name": observation.screen_name,
-                "batch_count": len(self.proactive_screen_contexts),
+                "batch": f"{batch_count}/{batch_limit}",
+                "batch_count": batch_count,
+                "batch_limit": batch_limit,
                 "dropped_count": self.proactive_screen_context_dropped_count,
-                "image": observation.data_url,
+                "image_chars": len(observation.data_url),
             },
         )
 
@@ -3934,7 +3963,7 @@ class PetWindow(QWidget):
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
             payload["screen_context_window_ended_at"] = screen_contexts[-1].get("captured_at", "")
-            debug_log(
+            log_event(
                 "ScreenAwareness",
                 "主动屏幕上下文批次已附加",
                 {
@@ -3964,7 +3993,7 @@ class PetWindow(QWidget):
         self.last_proactive_screen_context_at = None
         self.proactive_screen_context_dropped_count = 0
         if had_batch:
-            debug_log("ScreenAwareness", "主动屏幕上下文批次已清空", {"reason": reason})
+            log_event("ScreenAwareness", "主动屏幕上下文批次已清空", {"reason": reason})
 
     def _run_event_worker(self, event: AgentEvent, reminder_id: str | None = None) -> None:
         if getattr(self, "startup_initializing", False):
@@ -4050,7 +4079,7 @@ class PetWindow(QWidget):
         if not night_key:
             return result
         if self._screen_awareness_health_reminder_seen(night_key):
-            debug_log(
+            log_event(
                 "ScreenAwareness",
                 "夜间健康类主动提醒已达上限，改为屏幕内容分析",
                 {"night_key": night_key},
@@ -4098,7 +4127,7 @@ class PetWindow(QWidget):
                 backup=False,
             )
         except OSError as exc:
-            debug_log("ScreenAwareness", "主动屏幕感知状态保存失败", {"error": str(exc)})
+            log_event("ScreenAwareness", "主动屏幕感知状态保存失败", {"error": str(exc)})
 
     @Slot(str)
     def _handle_event_error(self, message: str) -> None:
@@ -4111,7 +4140,7 @@ class PetWindow(QWidget):
         reminder_id = self.active_reminder_id
         reminder_text = self.active_reminder_text
         self._clear_active_event()
-        debug_log("Event", "主动事件生成失败", {"error": message})
+        log_event("Event", "主动事件生成失败", {"error": message})
         if event_type == "reminder_due":
             result = AgentResult(
                 reply=ChatReply(
@@ -4144,7 +4173,7 @@ class PetWindow(QWidget):
         try:
             self.reminder_store.mark_completed(reminder_id)
         except ValueError as exc:
-            debug_log("Reminder", "标记完成失败", {"error": str(exc)})
+            log_event("Reminder", "标记完成失败", {"error": str(exc)})
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
@@ -4219,8 +4248,17 @@ class PetWindow(QWidget):
         if not self.memory_curation_settings.enabled:
             return
         pending_turns = self.memory_curation_state.increment_pending_turns()
-        debug_log("Memory", "自动记忆轮次已累计", {"pending_turns": pending_turns})
-        if pending_turns >= self.memory_curation_settings.trigger_turns:
+        trigger_turns = max(1, int(self.memory_curation_settings.trigger_turns))
+        log_event(
+            "Memory",
+            "自动记忆轮次已累计",
+            {
+                "pending_turns": pending_turns,
+                "trigger_turns": trigger_turns,
+                "remaining_turns": max(0, trigger_turns - pending_turns),
+            },
+        )
+        if pending_turns >= trigger_turns:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
     def _maybe_start_auto_memory_curation(self) -> None:
@@ -4228,7 +4266,8 @@ class PetWindow(QWidget):
             return
         if not self.memory_curation_settings.enabled:
             return
-        if self.memory_curation_state.pending_turns() < self.memory_curation_settings.trigger_turns:
+        trigger_turns = max(1, int(self.memory_curation_settings.trigger_turns))
+        if self.memory_curation_state.pending_turns() < trigger_turns:
             return
         if not self._memory_curation_can_start():
             return
@@ -4285,7 +4324,7 @@ class PetWindow(QWidget):
     ) -> None:
         if not entries or self.memory_curation_thread is not None:
             return
-        debug_log(
+        log_event(
             "Memory",
             "启动记忆整理",
             {
@@ -4293,6 +4332,12 @@ class PetWindow(QWidget):
                 "entry_count": len(entries),
                 "target_history_count": target_history_count,
                 "consumed_turns": consumed_turns,
+                "auto_attempt": (
+                    getattr(self, "_auto_memory_curation_failure_attempts", 0) + 1
+                    if mode == "auto"
+                    else None
+                ),
+                "max_auto_attempts": MAX_AUTO_RETRY_ATTEMPTS if mode == "auto" else None,
             },
         )
         self.memory_curation_mode = mode
@@ -4322,7 +4367,9 @@ class PetWindow(QWidget):
         if getattr(self, "_shutdown_in_progress", False):
             return
         mode = self.memory_curation_mode
-        debug_log(
+        self._auto_memory_curation_failure_attempts = 0
+        self._suppress_auto_memory_curation_restart = False
+        log_event(
             "Memory",
             "记忆整理完成",
             {
@@ -4342,14 +4389,38 @@ class PetWindow(QWidget):
     def _handle_memory_curation_failed(self, message: str) -> None:
         if getattr(self, "_shutdown_in_progress", False):
             return
-        debug_log(
+        mode = self.memory_curation_mode
+        attempt = 0
+        if mode == "auto":
+            attempt = getattr(self, "_auto_memory_curation_failure_attempts", 0) + 1
+            self._auto_memory_curation_failure_attempts = attempt
+        log_event(
             "Memory",
             "记忆整理失败",
             {
-                "mode": self.memory_curation_mode,
+                "mode": mode,
+                "attempt": attempt or None,
+                "max_attempts": MAX_AUTO_RETRY_ATTEMPTS if mode == "auto" else None,
                 "error": message,
             },
         )
+        if mode == "auto" and attempt >= MAX_AUTO_RETRY_ATTEMPTS:
+            consumed_turns = max(0, int(self.memory_curation_consumed_turns))
+            self.memory_curation_state.consume_pending_turns(consumed_turns)
+            self._suppress_auto_memory_curation_restart = True
+            self._auto_memory_curation_failure_attempts = 0
+            user_message = "自动记忆整理连续失败，已停止本轮，稍后会在下次整理时再试"
+            log_event(
+                "Memory",
+                "自动记忆整理连续失败",
+                {
+                    "attempt": attempt,
+                    "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                    "consumed_turns": consumed_turns,
+                    "error": message,
+                },
+            )
+            self._show_auto_memory_curation_stopped_message(user_message)
 
     @Slot()
     def _cleanup_memory_curation_worker(self) -> None:
@@ -4358,7 +4429,16 @@ class PetWindow(QWidget):
         self.memory_curation_consumed_turns = 0
         if getattr(self, "_shutdown_in_progress", False):
             return
+        if getattr(self, "_suppress_auto_memory_curation_restart", False):
+            self._suppress_auto_memory_curation_restart = False
+            return
         QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+
+    def _show_auto_memory_curation_stopped_message(self, message: str) -> None:
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        show_text_immediately = getattr(subtitle_controller, "show_text_immediately", None)
+        if callable(show_text_immediately):
+            show_text_immediately(message)
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:
@@ -4418,7 +4498,7 @@ class PetWindow(QWidget):
         QTimer.singleShot(0, self._maybe_start_memory_backfill)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
-        debug_log(
+        log_event(
             "Startup",
             "后台启动服务已注入窗口",
             {
@@ -4429,7 +4509,7 @@ class PetWindow(QWidget):
             },
         )
         for error in services.errors:
-            debug_log("Startup", "后台初始化错误", {"error": error})
+            log_event("Startup", "后台初始化错误", {"error": error})
             if error.startswith("TTS"):
                 self._show_tts_error(error)
 
@@ -4444,32 +4524,32 @@ class PetWindow(QWidget):
         self._set_busy(False)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
-        debug_log("Startup", "后台启动服务失败", {"error": error})
-        debug_log("Startup", "后台初始化失败", {"error": error})
+        log_event("Startup", "后台启动服务失败", {"error": error})
+        log_event("Startup", "后台初始化失败", {"error": error})
 
     def _close_deferred_services(self, services: "DeferredStartupServices") -> None:
-        debug_log("Startup", "关闭期间收到后台启动结果，立即释放服务")
+        log_event("Startup", "关闭期间收到后台启动结果，立即释放服务")
         for provider in (getattr(services, "tts_provider", None),):
             close = getattr(provider, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception as exc:  # noqa: BLE001
-                    debug_log("TTS", "关闭延迟启动 TTS Provider 失败", {"error": str(exc)})
+                    log_event("TTS", "关闭延迟启动 TTS Provider 失败", {"error": str(exc)})
         mcp_tool_provider = getattr(services, "mcp_tool_provider", None)
         close_mcp = getattr(mcp_tool_provider, "close", None)
         if callable(close_mcp):
             try:
                 close_mcp()
             except Exception as exc:  # noqa: BLE001
-                debug_log("MCP", "关闭延迟启动 MCP Provider 失败", {"error": str(exc)})
+                log_event("MCP", "关闭延迟启动 MCP Provider 失败", {"error": str(exc)})
         plugin_manager = getattr(services, "plugin_manager", None)
         shutdown_all = getattr(plugin_manager, "shutdown_all", None)
         if callable(shutdown_all):
             try:
                 shutdown_all()
             except Exception as exc:  # noqa: BLE001
-                debug_log("PluginManager", "关闭延迟启动插件失败", {"error": str(exc)})
+                log_event("PluginManager", "关闭延迟启动插件失败", {"error": str(exc)})
 
     def _wire_plugin_service_backends(self) -> None:
         """把宿主真实后端注入插件服务门面（当前：输入框填充）。
@@ -4483,7 +4563,7 @@ class PetWindow(QWidget):
         try:
             services.set_backends(input_text_sink=self._request_fill_input_text)
         except Exception as exc:  # noqa: BLE001 — 装配失败不得阻断启动
-            debug_log("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
+            log_event("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
 
     def _request_fill_input_text(self, text: str) -> None:
         """插件侧入口：请求把文本填入输入框。
@@ -4502,7 +4582,7 @@ class PetWindow(QWidget):
             self.input_edit.setFocus()
         except RuntimeError as exc:
             # 输入控件可能已被销毁
-            debug_log("PetWindow", "填入插件输入文本失败", {"error": str(exc)})
+            log_event("PetWindow", "填入插件输入文本失败", {"error": str(exc)})
 
     def _sync_plugin_chat_ui_widgets(self) -> None:
         layout = self.input_bar.layout() if hasattr(self, "input_bar") else None
@@ -4545,7 +4625,7 @@ class PetWindow(QWidget):
         try:
             connect(self._show_tts_error)
         except (TypeError, RuntimeError) as exc:
-            debug_log("TTS", "连接 TTS 错误提示信号失败", {"error": str(exc)})
+            log_event("TTS", "连接 TTS 错误提示信号失败", {"error": str(exc)})
 
     def _disconnect_tts_error_signal(self, provider: TTSProvider) -> None:
         error_signal = getattr(provider, "error_occurred", None)
@@ -4567,7 +4647,7 @@ class PetWindow(QWidget):
         try:
             warm_up()
         except Exception as exc:  # noqa: BLE001
-            debug_log(
+            log_event(
                 "TTS",
                 "播放器预热请求失败",
                 {
@@ -4581,13 +4661,13 @@ class PetWindow(QWidget):
 
     def _start_tts_ready_warmup(self, provider: TTSProvider) -> None:
         if isinstance(provider, NullTTSProvider):
-            debug_log("TTS", "TTS 已关闭，跳过服务预热")
+            log_event("TTS", "TTS 已关闭，跳过服务预热")
             return
         ensure_ready = getattr(provider, "ensure_ready", None)
         if not callable(ensure_ready):
             return
         if self.tts_ready_warmup_thread is not None:
-            debug_log("TTS", "TTS 服务预热已在进行，跳过重复请求")
+            log_event("TTS", "TTS 服务预热已在进行，跳过重复请求")
             return
 
         worker = TTSReadyWarmupWorker(provider)
@@ -4670,14 +4750,14 @@ class PetWindow(QWidget):
         try:
             add_listener(self.memory_status_changed.emit)
         except (TypeError, RuntimeError) as exc:
-            debug_log("Memory", "连接长期记忆状态监听失败", {"error": str(exc)})
+            log_event("Memory", "连接长期记忆状态监听失败", {"error": str(exc)})
 
     @Slot(str, str)
     def _handle_memory_status_changed(self, status: str, message: str) -> None:
         message = str(message).strip()
         if not message:
             return
-        debug_log("Memory", "长期记忆状态变化", {"status": status, "message": message})
+        log_event("Memory", "长期记忆状态变化", {"status": status, "message": message})
         if status in {"loading", "reloading", "failed"}:
             self._show_memory_status_message(status, message)
             return
@@ -4785,7 +4865,7 @@ class PetWindow(QWidget):
         self.tts_error_label.setVisible(True)
         self.tts_error_timer.start(TTS_ERROR_DISPLAY_MS)
         self._log_interaction_stage("tts_error_visible", {"message": message})
-        debug_log("TTS", "TTS 错误已显示到界面", {"message": message})
+        log_event("TTS", "TTS 错误已显示到界面", {"message": message})
 
     @Slot()
     def _hide_tts_error(self) -> None:
@@ -4855,7 +4935,7 @@ class PetWindow(QWidget):
             log.append(event)
         if inject:
             self.runtime_event_queue.push(event)
-        debug_log("PetWindow", "运行时事件", {"event": event.to_dict(), "inject": inject})
+        log_event("PetWindow", "运行时事件", {"event": event.to_dict(), "inject": inject})
 
     def _handle_application_activated(self) -> None:
         if getattr(self, "hidden_to_tray", False):
@@ -5284,8 +5364,8 @@ class PetWindow(QWidget):
                 try:
                     close_unused()
                 except Exception as exc:  # noqa: BLE001
-                    debug_log("TTS", "丢弃未使用的等价 TTS Provider 失败", {"error": str(exc)})
-            debug_log("PetWindow", "TTS 配置与角色均未变,保留现有 Provider,跳过重建")
+                    log_event("TTS", "丢弃未使用的等价 TTS Provider 失败", {"error": str(exc)})
+            log_event("PetWindow", "TTS 配置与角色均未变,保留现有 Provider,跳过重建")
         self._apply_character(selected_profile)
         apply_backchannel_settings = getattr(self, "_apply_backchannel_settings", None)
         if callable(apply_backchannel_settings):
@@ -5435,7 +5515,7 @@ class PetWindow(QWidget):
         settings: GPTSoVITSTTSSettings,
     ) -> TTSProvider | None:
         if not settings.enabled:
-            debug_log("PetWindow", "设置保存后 TTS 保持关闭")
+            log_event("PetWindow", "设置保存后 TTS 保持关闭")
             return NullTTSProvider()
         try:
             # 统一走工厂；补传 base_dir 修正旧实现缓存目录回退 __file__ 推算的问题
@@ -5444,7 +5524,7 @@ class PetWindow(QWidget):
                 base_dir=self.base_dir,
                 adopt_existing_service=False,
             )
-            debug_log(
+            log_event(
                 "PetWindow",
                 "设置保存后 TTS Provider 已创建",
                 {
@@ -5455,7 +5535,7 @@ class PetWindow(QWidget):
             )
             return provider
         except TTSConfigError as exc:
-            debug_log("PetWindow", "TTS 配置无效", {"error": str(exc)})
+            log_event("PetWindow", "TTS 配置无效", {"error": str(exc)})
             show_themed_critical(
                 self,
                 "TTS 配置无效",
@@ -5482,7 +5562,7 @@ class PetWindow(QWidget):
         warmup_provider = getattr(self, "_tts_warmup_provider", None)
         if warmup_thread is not None and provider is warmup_provider:
             self._tts_pending_provider_closes.append((provider, keep_local_service))
-            debug_log(
+            log_event(
                 "TTS",
                 "服务预热在途,推迟关闭旧 TTS Provider",
                 {
@@ -5509,13 +5589,13 @@ class PetWindow(QWidget):
             if callable(detach):
                 try:
                     detach()
-                    debug_log(
+                    log_event(
                         "TTS",
                         "切换配置时保留本地 TTS 服务进程",
                         {"provider": type(provider).__name__},
                     )
                 except Exception as exc:  # noqa: BLE001
-                    debug_log(
+                    log_event(
                         "TTS",
                         "交出旧 TTS 本地服务所有权失败",
                         {"provider": type(provider).__name__, "error": str(exc)},
@@ -5525,7 +5605,7 @@ class PetWindow(QWidget):
             try:
                 close()
             except Exception as exc:  # noqa: BLE001
-                debug_log(
+                log_event(
                     "TTS",
                     "切换配置时关闭旧 TTS Provider 失败",
                     {"provider": type(provider).__name__, "error": str(exc)},
@@ -5565,8 +5645,8 @@ class PetWindow(QWidget):
         try:
             self.history_store.append(role, content, translation, tone, portrait, _debug=_debug)
         except OSError as exc:
-            debug_log("History", "写入失败", {"error": str(exc)})
-            debug_log(
+            log_event("History", "写入失败", {"error": str(exc)})
+            log_event(
                 "History",
                 "写入失败",
                 {
@@ -5602,8 +5682,8 @@ class PetWindow(QWidget):
         try:
             due_reminders = self.reminder_store.due_reminders()
         except ValueError as exc:
-            debug_log("Reminder", "读取失败", {"error": str(exc)})
-            debug_log("Reminder", "读取失败", {"error": str(exc)})
+            log_event("Reminder", "读取失败", {"error": str(exc)})
+            log_event("Reminder", "读取失败", {"error": str(exc)})
             return
         if not due_reminders:
             return
@@ -5613,9 +5693,9 @@ class PetWindow(QWidget):
         reminder_text = str(reminder.get("text", ""))
         reminder_trigger_at = str(reminder.get("trigger_at", ""))
         if not reminder_id:
-            debug_log("Reminder", "跳过缺少 id 的到期提醒", {"reminder": reminder})
+            log_event("Reminder", "跳过缺少 id 的到期提醒", {"reminder": reminder})
             return
-        debug_log(
+        log_event(
             "Reminder",
             "触发到期提醒",
             {
@@ -5701,7 +5781,7 @@ class PetWindow(QWidget):
         system_values = self._load_system_config_values("screen_observation")
         if "enabled" in system_values:
             enabled = _parse_bool(system_values.get("enabled"), default=True)
-            debug_log("PetWindow", "屏幕观察 YAML 配置已加载", {"enabled": enabled})
+            log_event("PetWindow", "屏幕观察 YAML 配置已加载", {"enabled": enabled})
             return enabled
         return True
 
@@ -5710,7 +5790,7 @@ class PetWindow(QWidget):
         if "autonomous_enabled" in system_values:
             enabled = _parse_bool(system_values.get("autonomous_enabled"), default=True)
             enabled = enabled and self.screen_observation_enabled
-            debug_log("PetWindow", "自主屏幕观察 YAML 配置已加载", {"enabled": enabled})
+            log_event("PetWindow", "自主屏幕观察 YAML 配置已加载", {"enabled": enabled})
             return enabled
         return self.screen_observation_enabled
 
@@ -5908,7 +5988,7 @@ class PetWindow(QWidget):
                     )
                 self._stack_renderer_overlay_below()
             except Exception as exc:  # noqa: BLE001
-                debug_log("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
+                log_event("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
             return
         if sys.platform == "darwin":
             try:
@@ -5920,7 +6000,7 @@ class PetWindow(QWidget):
                     _set_macos_window_topmost(int(window.winId()), effective_topmost)
                 self._stack_renderer_overlay_below()
             except Exception as exc:  # noqa: BLE001
-                debug_log("PetWindow", "同步 macOS 原生置顶状态失败", {"error": str(exc)})
+                log_event("PetWindow", "同步 macOS 原生置顶状态失败", {"error": str(exc)})
 
     def _topmost_sync_windows(self):
         # 单窗口重构后只有主窗口一个顶层窗口，置顶仅作用于它。
@@ -5933,7 +6013,7 @@ class PetWindow(QWidget):
         try:
             manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
         except Exception as exc:  # noqa: BLE001
-            debug_log("RendererManager", "同步渲染窗口层级失败", {"error": str(exc)})
+            log_event("RendererManager", "同步渲染窗口层级失败", {"error": str(exc)})
 
     def _apply_layout_settings(
         self,
@@ -5999,7 +6079,7 @@ class PetWindow(QWidget):
                 },
             )
         except OSError as exc:
-            debug_log("PetWindow", "保存控制组布局失败", {"error": str(exc)})
+            log_event("PetWindow", "保存控制组布局失败", {"error": str(exc)})
 
     def _preview_layout(
         self,
@@ -6177,7 +6257,7 @@ class PetWindow(QWidget):
         try:
             backdrop.apply(card, self._card_tint())
         except Exception as exc:  # noqa: BLE001
-            debug_log("UI", "输入栏 macOS 原生毛玻璃应用失败", {"error": str(exc)})
+            log_event("UI", "输入栏 macOS 原生毛玻璃应用失败", {"error": str(exc)})
 
     def _remove_input_bar_native_backdrop(self) -> None:
         """移除输入栏 macOS 原生毛玻璃层，避免模式切换或隐藏后残留。"""
@@ -6188,7 +6268,7 @@ class PetWindow(QWidget):
         try:
             backdrop.remove(card)
         except Exception as exc:  # noqa: BLE001
-            debug_log("UI", "输入栏 macOS 原生毛玻璃移除失败", {"error": str(exc)})
+            log_event("UI", "输入栏 macOS 原生毛玻璃移除失败", {"error": str(exc)})
 
     def _sync_input_bar_native_backdrop_geometry(self) -> None:
         """输入栏布局变化时同步 NSVisualEffectView frame。"""
@@ -6558,7 +6638,7 @@ def _load_screen_awareness_history_entries(window: Any) -> list[ChatHistoryEntry
     try:
         entries = history_store.load()
     except OSError as exc:
-        debug_log("ScreenAwareness", "读取近期聊天历史失败", {"error": str(exc)})
+        log_event("ScreenAwareness", "读取近期聊天历史失败", {"error": str(exc)})
         return []
     return [entry for entry in entries if isinstance(entry, ChatHistoryEntry)]
 

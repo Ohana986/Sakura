@@ -13,11 +13,11 @@ from urllib.parse import urlparse, urlunparse
 from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
 from app.core.http_client import urlopen_direct_for_loopback
 from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
+from app.core.retry_policy import MAX_AUTO_RETRY_ATTEMPTS
 from app.core.runtime_log import log_event, summarize_messages
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
 
-MAX_API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 0.8
 STRUCTURED_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 ChatMessage = dict[str, Any]
@@ -429,7 +429,7 @@ class OpenAICompatibleClient:
         fallback_payload = dict(payload)
         for param in self._unsupported_chat_params:
             fallback_payload.pop(param, None)
-        while True:
+        for attempt in range(1, MAX_AUTO_RETRY_ATTEMPTS + 1):
             check_cancelled(cancel_checker)
             try:
                 return self._post_chat_completions(
@@ -443,7 +443,11 @@ class OpenAICompatibleClient:
                     log_event(
                         "API",
                         "结构化 response_format 不受支持，已回退普通请求",
-                        {"error": str(exc)},
+                        {
+                            "attempt": attempt,
+                            "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                            "error": str(exc),
+                        },
                     )
                     continue
                 if "temperature" in fallback_payload and _is_temperature_unsupported_error(exc):
@@ -452,10 +456,15 @@ class OpenAICompatibleClient:
                     log_event(
                         "API",
                         "模型不支持自定义 temperature，已回退默认温度",
-                        {"error": str(exc)},
+                        {
+                            "attempt": attempt,
+                            "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                            "error": str(exc),
+                        },
                     )
                     continue
                 raise
+        raise ApiRequestError("API 兼容性自动回退已达到最大次数。")
 
     def _ensure_chat_config(self, api_key_message: str) -> None:
         if not self.settings.api_key:
@@ -518,7 +527,7 @@ class OpenAICompatibleClient:
         cancel_checker: CancelChecker | None = None,
     ) -> str:
         last_error: BaseException | None = None
-        for attempt in range(1, MAX_API_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, MAX_AUTO_RETRY_ATTEMPTS + 1):
             check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
@@ -552,7 +561,7 @@ class OpenAICompatibleClient:
                         "error_body": error_body,
                     },
                 )
-                if exc.code not in {429, 500, 502, 503, 504} or attempt == MAX_API_RETRY_ATTEMPTS:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == MAX_AUTO_RETRY_ATTEMPTS:
                     raise ApiRequestError(_format_api_http_error(exc.code, error_body, request.full_url)) from exc
                 last_error = exc
             except urllib.error.URLError as exc:
@@ -566,7 +575,7 @@ class OpenAICompatibleClient:
                         "reason": str(exc.reason),
                     },
                 )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
+                if attempt == MAX_AUTO_RETRY_ATTEMPTS:
                     raise ApiRequestError(f"API 请求失败：{exc.reason}") from exc
                 last_error = exc
             except TimeoutError as exc:
@@ -579,7 +588,7 @@ class OpenAICompatibleClient:
                         "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                     },
                 )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
+                if attempt == MAX_AUTO_RETRY_ATTEMPTS:
                     raise ApiRequestError("API 请求超时。") from exc
                 last_error = exc
             except (ssl.SSLError, ConnectionError, http.client.RemoteDisconnected) as exc:
@@ -593,7 +602,7 @@ class OpenAICompatibleClient:
                         "error": str(exc),
                     },
                 )
-                if attempt == MAX_API_RETRY_ATTEMPTS:
+                if attempt == MAX_AUTO_RETRY_ATTEMPTS:
                     raise ApiRequestError(f"API 连接中断：{exc}") from exc
                 last_error = exc
 
@@ -602,7 +611,7 @@ class OpenAICompatibleClient:
                 "准备重试请求",
                 {
                     "attempt": attempt,
-                    "max_attempts": MAX_API_RETRY_ATTEMPTS,
+                    "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
                     "delay_seconds": API_RETRY_DELAY_SECONDS * attempt,
                     "last_error": str(last_error),
                 },

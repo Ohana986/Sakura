@@ -466,7 +466,9 @@ class AgentRuntime:
                         actions=emitted_actions,
                     )
                 if execution_results and _is_function_response_name_missing_error(exc):
-                    self._native_tool_results_blocked_models.add(self.api_client.settings.model)
+                    model = _api_client_model(self.api_client)
+                    if model:
+                        self._native_tool_results_blocked_models.add(model)
                     log_event(
                         "AgentRuntime",
                         "原生工具结果回填不被端点接受，改用文本工具结果总结",
@@ -765,7 +767,8 @@ class AgentRuntime:
             if not step_results:
                 break
 
-            if self.api_client.settings.model in self._native_tool_results_blocked_models:
+            model = _api_client_model(self.api_client)
+            if model and model in self._native_tool_results_blocked_models:
                 working_messages = [
                     *messages,
                     _build_tool_results_message(
@@ -1285,6 +1288,12 @@ def _reply_has_display_translation(reply: ChatReply) -> bool:
         segment.text.strip() and segment.translation.strip()
         for segment in reply.segments
     )
+
+
+def _api_client_model(api_client: Any) -> str:
+    settings = getattr(api_client, "settings", None)
+    model = getattr(settings, "model", "")
+    return str(model).strip()
 
 
 def _native_tool_call_to_policy_call(
