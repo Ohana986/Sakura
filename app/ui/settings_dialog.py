@@ -53,7 +53,7 @@ from app.backchannel.model_cache import (
     download_backchannel_model,
     import_backchannel_model_archive,
 )
-from app.core.debug_log import debug_log
+from app.core.runtime_log import log_event
 from app.storage.paths import StoragePaths
 from app.config.character_archive import (
     CharacterArchiveError,
@@ -2312,6 +2312,7 @@ class SettingsDialog(QDialog):
                     and self.debug_body_enabled_check.isChecked()
                 ),
                 file_enabled=self.debug_file_enabled_check.isChecked(),
+                profile=str(self.log_profile_combo.currentData() or "info"),
                 stage_debug_overlay=self.stage_debug_overlay_check.isChecked(),
                 stage_collision_mask=self.stage_collision_mask_check.isChecked(),
             ),

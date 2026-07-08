@@ -1065,14 +1065,30 @@ class SystemSettingsPage:
             owner.launch_at_login_check.setEnabled(False)
             owner.launch_at_login_check.setToolTip("当前平台暂不支持自动配置登录启动项。")
 
-        owner.debug_log_enabled_check = QCheckBox("输出终端调试日志", tab)
+        owner.debug_log_enabled_check = QCheckBox("输出控制台运行日志", tab)
         owner.debug_log_enabled_check.setChecked(debug_settings.enabled)
-        owner.debug_body_enabled_check = QCheckBox("输出完整请求/回复正文", tab)
+        owner.debug_body_enabled_check = QCheckBox("trace 时允许完整请求/回复正文", tab)
         owner.debug_body_enabled_check.setChecked(debug_settings.body_enabled)
         owner.debug_log_enabled_check.toggled.connect(owner.debug_body_enabled_check.setEnabled)
         owner.debug_body_enabled_check.setEnabled(owner.debug_log_enabled_check.isChecked())
-        owner.debug_file_enabled_check = QCheckBox("输出文件运行日志", tab)
+        owner.debug_file_enabled_check = QCheckBox("保存软件运行日志 JSONL", tab)
         owner.debug_file_enabled_check.setChecked(debug_settings.file_enabled)
+        owner.log_profile_combo = _NoWheelComboBox(tab)
+        owner.log_profile_combo.addItem("仅错误", "error")
+        owner.log_profile_combo.addItem("错误与警告", "warn")
+        owner.log_profile_combo.addItem("一般信息（推荐）", "info")
+        owner.log_profile_combo.addItem("详细信息", "debug")
+        owner.log_profile_combo.addItem("深度追踪", "trace")
+        profile_index = _resolve_log_level_index(owner.log_profile_combo, debug_settings.profile)
+        owner.log_profile_combo.setCurrentIndex(max(0, profile_index))
+        owner.log_profile_combo.setToolTip(
+            "控制终端、文件和软件内日志的详细程度。\n"
+            "仅错误：只记录严重错误\n"
+            "错误与警告：错误 + 警告信息\n"
+            "一般信息：日常操作信息（默认）\n"
+            "详细信息：含 SSE 流和模型请求/响应详情\n"
+            "深度追踪：全部日志，最详细"
+        )
         owner.stage_debug_overlay_check = QCheckBox("舞台调试框（开发者，画窗口/布局/立绘边界 + DPR）", tab)
         owner.stage_debug_overlay_check.setChecked(debug_settings.stage_debug_overlay)
         owner.stage_debug_overlay_check.setToolTip(
@@ -1181,6 +1197,7 @@ class SystemSettingsPage:
         debug_form.addRow("", owner.debug_log_enabled_check)
         debug_form.addRow("", owner.debug_body_enabled_check)
         debug_form.addRow("", owner.debug_file_enabled_check)
+        debug_form.addRow("日志档位", owner.log_profile_combo)
         debug_form.addRow("", owner.stage_debug_overlay_check)
         debug_form.addRow("", owner.stage_collision_mask_check)
         subtitle_form = QFormLayout()
@@ -1216,7 +1233,7 @@ class SystemSettingsPage:
         layout.setSpacing(12)
         for title, group_form in (
             ("启动", startup_form),
-            ("调试日志", debug_form),
+            ("运行日志", debug_form),
             ("字幕与回复", subtitle_form),
             ("气泡", bubble_form),
             ("接话", backchannel_form),
@@ -1457,3 +1474,19 @@ def _default_tts_api_url(provider: str) -> str:
 
 def _is_bundled_tts_provider(provider: str) -> bool:
     return provider in {TTS_PROVIDER_GPT_SOVITS, TTS_PROVIDER_GENIE}
+
+
+def _resolve_log_level_index(combo: object, stored_value: str) -> int:
+    """将存储的日志级别映射到下拉框索引，兼容旧 profile 值。
+
+    旧值映射：support → error, normal → info, verbose → debug, warning → warn
+    未识别值默认回退到 info 对应的索引。
+    """
+    value = str(stored_value or "info").strip().lower()
+    idx = combo.findData(value)
+    if idx >= 0:
+        return idx
+    legacy_map = {"support": "error", "normal": "info", "verbose": "debug", "warning": "warn"}
+    mapped = legacy_map.get(value, "info")
+    idx = combo.findData(mapped)
+    return max(0, idx)
