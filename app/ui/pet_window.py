@@ -682,6 +682,9 @@ class PetWindow(QWidget):
         self._dragging = False
         # Wayland 下 startSystemMove 后为 True，防后续 mouseMove 走 self.move 与合成器冲突。
         self._using_system_drag = False
+        # 记录本轮是否已经发生拖拽；系统拖拽可能先完成、后补发 release，
+        # 因此不能随 _dragging 一起提前清除，否则补发的 release 会被误判为单击。
+        self._drag_release_pending = False
         # 鼠标是否在窗口内：由 enterEvent/leaveEvent 追踪，绕开 Wayland 上
         # QCursor.pos() 离开窗口后返回陈旧坐标的问题。
         self._cursor_in_window = False
@@ -1088,6 +1091,7 @@ class PetWindow(QWidget):
                 animator = getattr(self, "input_bar_animator", None)
                 self._using_system_drag = False
                 self._dragging = False
+                self.drag_anchor = None
                 if animator is not None and getattr(animator, "_suspended", False):
                     QTimer.singleShot(0, self._finish_drag_resume)
 
@@ -1625,9 +1629,14 @@ class PetWindow(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._clear_input_focus_for_pet_interaction()
             # Wayland 上 startSystemMove 后合成器可能不投递 mouseReleaseEvent，
-            # 状态会残留到下一次交互；每次新 press 一律重置，不依赖 release 来清理。
+            # 状态会残留到下一次交互；新 press 开始前先恢复仍被挂起的输入栏，
+            # 再重置旧拖拽状态，避免旧看门狗因标志清除而无法完成恢复。
+            animator = getattr(self, "input_bar_animator", None)
+            if animator is not None and getattr(animator, "_suspended", False):
+                self._finish_drag_resume()
             self._dragging = False
             self._using_system_drag = False
+            self._drag_release_pending = False
             # 只记锚点；首次 mouseMove 才决定走系统拖动还是 self.move，保留单击/拖动的区分。
             self.drag_anchor = self._drag_anchor_from_event(event, source_widget)
             event.accept()
@@ -1647,6 +1656,7 @@ class PetWindow(QWidget):
             if not self._dragging:
                 # 首次进入拖动：收起输入栏，避免静态模糊背景与移动后的真实桌面对不上而穿帮。
                 self._dragging = True
+                self._drag_release_pending = True
                 self.input_bar_animator.suspend_for_drag()
                 # Wayland 下 QWidget.move() 被合成器忽略，改用 startSystemMove 委托合成器拖动。
                 window = self.windowHandle()
@@ -1666,10 +1676,15 @@ class PetWindow(QWidget):
 
     def _handle_mouse_release(self, event: QMouseEvent) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
-            was_dragging = self._dragging
+            # 系统拖拽可能已由 moveEvent/看门狗完成 UI 恢复，随后才补发 release；
+            # _drag_release_pending 保留“本轮发生过拖拽”的事实，避免误触发单击行为。
+            was_dragging = self._dragging or bool(
+                getattr(self, "_drag_release_pending", False)
+            )
             self.drag_anchor = None
             self._dragging = False
             self._using_system_drag = False
+            self._drag_release_pending = False
             if was_dragging:
                 # 拖动结束：延一帧等窗口真正落位，再重截新位置桌面并重新显示输入栏。
                 QTimer.singleShot(0, self._finish_drag_resume)
@@ -1695,6 +1710,7 @@ class PetWindow(QWidget):
             return
         self._using_system_drag = False
         self._dragging = False
+        self.drag_anchor = None
         QTimer.singleShot(0, self._finish_drag_resume)
 
     def _finish_drag_resume(self) -> None:

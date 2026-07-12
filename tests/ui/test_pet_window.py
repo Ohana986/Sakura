@@ -2640,6 +2640,140 @@ def test_pet_window_drag_uses_start_system_move_when_window_handle_supports() ->
     assert window.move_positions == []
 
 
+def test_pet_window_new_press_recovers_stale_system_drag_suspension() -> None:  # type: ignore[no-untyped-def]
+    """验证旧系统拖拽缺失 release 时，新交互会先恢复挂起的输入栏。"""
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import PetWindow
+
+    class MouseEventStub:
+        accepted = False
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def position(self):  # type: ignore[no-untyped-def]
+            return qtcore.QPointF(12, 18)
+
+        def globalPosition(self):  # type: ignore[no-untyped-def]
+            return qtcore.QPointF(112, 118)
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self._suspended = True
+            self.resume_calls = 0
+
+        def resume_after_drag(self) -> None:
+            if not self._suspended:
+                return
+            self._suspended = False
+            self.resume_calls += 1
+
+    class MinimalWindow:
+        _handle_mouse_press = PetWindow._handle_mouse_press
+        _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
+        _finish_drag_resume = PetWindow._finish_drag_resume
+
+        def __init__(self) -> None:
+            self.drag_anchor = qtcore.QPoint(1, 1)
+            self._dragging = True
+            self._using_system_drag = True
+            self._drag_release_pending = True
+            self.input_bar_animator = AnimatorStub()
+
+    window = MinimalWindow()
+    event = MouseEventStub()
+
+    assert window._handle_mouse_press(event) is True
+    assert window.input_bar_animator.resume_calls == 1
+    assert window.input_bar_animator._suspended is False
+    assert window._using_system_drag is False
+    assert window._dragging is False
+    assert window._drag_release_pending is False
+    assert window.drag_anchor == qtcore.QPoint(12, 18)
+
+
+def test_pet_window_late_release_after_system_drag_timeout_is_not_click(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """验证看门狗完成拖拽后补发的 release 不会被误判为单击。"""
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    scheduled_callbacks: list[tuple[int, object]] = []
+
+    class ApplicationStub:
+        @staticmethod
+        def instance():  # type: ignore[no-untyped-def]
+            return None
+
+    class MouseEventStub:
+        accepted = False
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self._suspended = True
+            self.resume_calls = 0
+
+        def resume_after_drag(self) -> None:
+            if not self._suspended:
+                return
+            self._suspended = False
+            self.resume_calls += 1
+
+    class MinimalWindow:
+        _check_system_drag_timeout = PetWindow._check_system_drag_timeout
+        _handle_mouse_release = PetWindow._handle_mouse_release
+        _finish_drag_resume = PetWindow._finish_drag_resume
+
+        def __init__(self) -> None:
+            self.drag_anchor = qtcore.QPoint(20, 30)
+            self._dragging = True
+            self._using_system_drag = True
+            self._drag_release_pending = True
+            self.input_bar_animator = AnimatorStub()
+            self.pet_clicks = 0
+
+        def _handle_pet_click(self) -> None:
+            self.pet_clicks += 1
+
+    monkeypatch.setattr(pet_window_module, "QApplication", ApplicationStub)
+    monkeypatch.setattr(
+        pet_window_module.QTimer,
+        "singleShot",
+        lambda delay, callback: scheduled_callbacks.append((delay, callback)),
+    )
+
+    window = MinimalWindow()
+    window._check_system_drag_timeout()
+
+    assert window._dragging is False
+    assert window._using_system_drag is False
+    assert window._drag_release_pending is True
+    assert window.drag_anchor is None
+    assert len(scheduled_callbacks) == 1
+
+    event = MouseEventStub()
+    assert window._handle_mouse_release(event) is True
+    assert event.accepted
+    assert window.pet_clicks == 0
+    assert window._drag_release_pending is False
+
+    for _delay, callback in scheduled_callbacks:
+        callback()  # type: ignore[operator]
+    assert window.input_bar_animator.resume_calls == 1
+
+
 def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
