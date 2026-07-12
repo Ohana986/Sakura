@@ -50,7 +50,13 @@ from app.voice.tts_types import (
     _set_service_state,
 )
 
+_DIRECT_TTS_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
+
+
+def _urlopen_tts_direct(request: urllib.request.Request, *, timeout: int) -> object:
+    """Local TTS endpoints must not inherit user/system HTTP proxies."""
+    return _DIRECT_TTS_OPENER.open(request, timeout=timeout)
 
 
 def _service_project_root(base_dir: Path | None = None) -> Path:

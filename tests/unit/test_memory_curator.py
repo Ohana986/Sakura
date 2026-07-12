@@ -379,10 +379,10 @@ def _entry(role: str, content: str) -> ChatHistoryEntry:
 def _runtime_json_path(name: str) -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "__pycache__"
+        / "temp"
         / "test_runtime"
-        / name
         / uuid.uuid4().hex
+        / name
         / f"{name}.json"
     )
 
@@ -390,10 +390,10 @@ def _runtime_json_path(name: str) -> Path:
 def _runtime_root(name: str) -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "__pycache__"
+        / "temp"
         / "test_runtime"
-        / name
         / uuid.uuid4().hex
+        / name
     )
 
 

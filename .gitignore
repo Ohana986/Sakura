@@ -17,9 +17,14 @@ runtime/
 /tts/
 env/
 node_modules/
+tools/settings-tauri/src-tauri/target/
+tools/settings-tauri/src-tauri/gen/
+tools/studio-tauri/src-tauri/target/
+tools/studio-tauri/src-tauri/gen/
 characters/
 
 .pytest_cache/
+.pytest-basetemp/
 .pytest_tmp/
 .pytest_tmp*/
 tmp_pytest/
@@ -47,6 +52,7 @@ data/logs/
 data/cache/
 data/sakura.lock
 data/migration_backup/
+data/character_studio/
 data/.test_visual_context_*.tmp
 tts/
 data/config/api.yaml
