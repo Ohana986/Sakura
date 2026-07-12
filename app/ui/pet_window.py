@@ -555,6 +555,11 @@ class PetWindow(QWidget):
         self.drag_anchor: QPoint | None = None
         # 是否正在拖动窗口：首次 move 置位，用于拖动时收起输入栏、区分单击与拖动（单击桌宠唤回气泡）。
         self._dragging = False
+        # Wayland 下 startSystemMove 后为 True，防后续 mouseMove 走 self.move 与合成器冲突。
+        self._using_system_drag = False
+        # 鼠标是否在窗口内：由 enterEvent/leaveEvent 追踪，绕开 Wayland 上
+        # QCursor.pos() 离开窗口后返回陈旧坐标的问题。
+        self._cursor_in_window = False
         self.portrait_scale_percent = self._load_portrait_scale_percent()
         self.control_panel_width = self._load_control_panel_width()
         self.bubble_height = self._load_bubble_height()
@@ -1006,6 +1011,18 @@ class PetWindow(QWidget):
         # 气泡/输入栏是子控件会自动跟随；独立渲染器窗口需要同步屏幕坐标。
         self._sync_renderer_overlay_geometry()
 
+        # Wayland 下合成器接管 startSystemMove 后通常不投递
+        # mouseReleaseEvent，借 moveEvent 监测松手并恢复 UI。
+        # 标志位无条件重置，不耦合 animator._suspended（仅动画恢复需要守卫）。
+        if getattr(self, "_using_system_drag", False):
+            app = QApplication.instance()
+            if app and not (app.mouseButtons() & Qt.MouseButton.LeftButton):
+                animator = getattr(self, "input_bar_animator", None)
+                self._using_system_drag = False
+                self._dragging = False
+                if animator is not None and getattr(animator, "_suspended", False):
+                    QTimer.singleShot(0, self._finish_drag_resume)
+
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
         # 子控件随主窗口显示；此处只需把它们摆到位并启动动画/自动隐藏。
@@ -1030,6 +1047,18 @@ class PetWindow(QWidget):
         super().hideEvent(event)
         # 子控件随主窗口隐藏，无需单独 hide。
         self._refresh_tray_menu()
+
+    def enterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        """鼠标进入窗口区域。在 Wayland 上 QCursor.pos() 离开窗口后返回陈旧
+        坐标，此事件是追踪鼠标驻留状态的可靠来源。"""
+        super().enterEvent(event)
+        self._cursor_in_window = True
+
+    def leaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        """鼠标离开窗口区域。Wayland 合成器通过 wl_pointer.leave 可靠投递此事件，
+        用于将 _cursor_in_window 置 False，绕开 QCursor.pos() 的陈旧坐标问题。"""
+        super().leaveEvent(event)
+        self._cursor_in_window = False
 
     def changeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().changeEvent(event)
@@ -1466,6 +1495,11 @@ class PetWindow(QWidget):
     def _handle_mouse_press(self, event: QMouseEvent, source_widget: QWidget | None = None) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
             self._clear_input_focus_for_pet_interaction()
+            # Wayland 上 startSystemMove 后合成器可能不投递 mouseReleaseEvent，
+            # 状态会残留到下一次交互；每次新 press 一律重置，不依赖 release 来清理。
+            self._dragging = False
+            self._using_system_drag = False
+            # 只记锚点；首次 mouseMove 才决定走系统拖动还是 self.move，保留单击/拖动的区分。
             self.drag_anchor = self._drag_anchor_from_event(event, source_widget)
             event.accept()
             return True
@@ -1476,10 +1510,26 @@ class PetWindow(QWidget):
 
     def _handle_mouse_move(self, event: QMouseEvent) -> bool:
         if event.buttons() & Qt.MouseButton.LeftButton and self.drag_anchor is not None:
+            # 已交由系统拖拽接管，直接接受事件，不再执行 self.move 避免冲突。
+            if self._using_system_drag:
+                event.accept()
+                return True
+
             if not self._dragging:
                 # 首次进入拖动：收起输入栏，避免静态模糊背景与移动后的真实桌面对不上而穿帮。
                 self._dragging = True
                 self.input_bar_animator.suspend_for_drag()
+                # Wayland 下 QWidget.move() 被合成器忽略，改用 startSystemMove 委托合成器拖动。
+                window = self.windowHandle()
+                if window is not None and hasattr(window, "startSystemMove"):
+                    if window.startSystemMove():
+                        self._using_system_drag = True
+                        # 看门狗：部分合成器在零位移/原地松手时可能既不投递
+                        # mouseReleaseEvent 也不触发 moveEvent，超时后自动恢复 UI。
+                        QTimer.singleShot(1000, self._check_system_drag_timeout)
+                        event.accept()
+                        return True
+            # 回退路径（合成器不支持 startSystemMove 时）
             self.move(event.globalPosition().toPoint() - self.drag_anchor)
             event.accept()
             return True
@@ -1490,6 +1540,7 @@ class PetWindow(QWidget):
             was_dragging = self._dragging
             self.drag_anchor = None
             self._dragging = False
+            self._using_system_drag = False
             if was_dragging:
                 # 拖动结束：延一帧等窗口真正落位，再重截新位置桌面并重新显示输入栏。
                 QTimer.singleShot(0, self._finish_drag_resume)
@@ -1503,6 +1554,19 @@ class PetWindow(QWidget):
             event.accept()
             return True
         return False
+
+    def _check_system_drag_timeout(self) -> None:
+        """startSystemMove 超时兜底：合成器未投递 moveEvent/mouseReleaseEvent
+        时的最后恢复手段；左键仍按压则延后 1s 重试。"""
+        if not self._using_system_drag:
+            return
+        app = QApplication.instance()
+        if app and (app.mouseButtons() & Qt.MouseButton.LeftButton):
+            QTimer.singleShot(1000, self._check_system_drag_timeout)
+            return
+        self._using_system_drag = False
+        self._dragging = False
+        QTimer.singleShot(0, self._finish_drag_resume)
 
     def _finish_drag_resume(self) -> None:
         """拖动松手后：让输入栏按可见性重算（重截新位置桌面后现身）。
@@ -2514,14 +2578,19 @@ class PetWindow(QWidget):
             return False
         if not self._input_bar_foreground_allowed():
             return False
+        # 快速路径：离开窗口后 leaveEvent 已将 _cursor_in_window 置 False，
+        # 绕开 Wayland 上 QCursor.pos() 离开窗口后返回陈旧坐标的问题。
+        if not self._cursor_in_window:
+            return False
         # 单窗口重构后气泡/输入栏已并入主窗口，主窗口几何即桌宠整体区域；
         # 但只有桌宠实际位于光标下方时才视为悬停，避免窗口被其他软件遮挡时误触发输入栏浮现。
         pos = QCursor.pos()
-        return (
+        result = (
             self.isVisible()
             and self.frameGeometry().contains(pos)
             and self._cursor_over_exposed_pet_window(pos)
         )
+        return result
 
     def _cursor_over_exposed_pet_window(self, pos: QPoint) -> bool:
         """确认当前全局坐标实际命中的 Qt 窗口属于桌宠。
@@ -5412,6 +5481,22 @@ class PetWindow(QWidget):
         self._apply_window_flags()
         if checked and not bool(getattr(self, "_secondary_windows_suppress_topmost", False)):
             self.raise_()
+        # Wayland 下 WindowStaysOnTopHint 被合成器忽略，弹一次性提示。
+        # 使用 QPA 平台名而非 XDG_SESSION_TYPE，避免 XWayland 误报。
+        app = QApplication.instance()
+        is_wayland_qpa = app is not None and app.platformName().startswith("wayland")
+        if checked and is_wayland_qpa:
+            if not getattr(self, "_wayland_topmost_warned", False):
+                self._wayland_topmost_warned = True
+                try:
+                    show_themed_information(
+                        self,
+                        "当前桌面不支持置顶",
+                        "Wayland 桌面环境没有标准的窗口置顶协议，"
+                        "因此「保持置顶」功能在您的系统上不可用。",
+                    )
+                except Exception:
+                    pass
         # 已打开的设置/历史/日志窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
         self._sync_secondary_windows_topmost()
         if hasattr(self, "tray_icon"):
