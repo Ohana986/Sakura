@@ -62,7 +62,7 @@ _LEGACY_DEFAULT_VISION_MODEL = "gpt-4o"
 class DebugLogSettings:
     """运行日志配置。"""
 
-    enabled: bool = False
+    enabled: bool = True
     body_enabled: bool = False
     file_enabled: bool = True
     profile: str = "info"
@@ -543,7 +543,7 @@ class AppSettingsService:
     def load_debug_log_settings(self) -> DebugLogSettings:
         debug = self._system_section("debug")
         return DebugLogSettings(
-            enabled=_bool_value(debug.get("enabled"), False),
+            enabled=_bool_value(debug.get("enabled"), True),
             body_enabled=_bool_value(debug.get("body_enabled"), False),
             file_enabled=_bool_value(debug.get("file_enabled"), True),
             profile=_log_level_value(debug.get("profile"), "info"),
