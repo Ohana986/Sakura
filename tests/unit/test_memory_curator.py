@@ -310,6 +310,19 @@ def test_memory_curation_state_waits_until_trigger_turns() -> None:
     assert state.pending_turns() == DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
 
 
+def test_memory_curation_state_consumes_pending_turns_without_advancing_history() -> None:
+    state = MemoryCurationState(_runtime_json_path("memory_curation_state_consume"))
+    state.mark_processed(12)
+    for _ in range(5):
+        state.increment_pending_turns()
+
+    state.consume_pending_turns(3)
+
+    snapshot = state.snapshot()
+    assert snapshot["processed_history_count"] == 12
+    assert snapshot["pending_turns"] == 2
+
+
 def test_memory_entries_ignore_tone_and_portrait_metadata() -> None:
     entries = _entries_for_model(
         [
@@ -366,10 +379,10 @@ def _entry(role: str, content: str) -> ChatHistoryEntry:
 def _runtime_json_path(name: str) -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "__pycache__"
+        / "temp"
         / "test_runtime"
-        / name
         / uuid.uuid4().hex
+        / name
         / f"{name}.json"
     )
 
@@ -377,10 +390,10 @@ def _runtime_json_path(name: str) -> Path:
 def _runtime_root(name: str) -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "__pycache__"
+        / "temp"
         / "test_runtime"
-        / name
         / uuid.uuid4().hex
+        / name
     )
 
 
