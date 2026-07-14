@@ -286,6 +286,8 @@ class TauriTtsResult:
     python_path: str = ""
     tts_config_path: str = ""
     timeout_seconds: int = 60
+    use_remote_paths: bool = False
+    remote_characters_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,8 @@ def tts_settings_from_tauri_result(
     work_dir = _optional_tauri_path(getattr(result_tts, "work_dir", ""), base_dir)
     python_path = _optional_tauri_path(getattr(result_tts, "python_path", ""), base_dir)
     tts_config_path = _optional_tauri_path(getattr(result_tts, "tts_config_path", ""), base_dir)
+    use_remote_paths = bool(getattr(result_tts, "use_remote_paths", False))
+    remote_characters_path = str(getattr(result_tts, "remote_characters_path", ""))
     selected_voice = getattr(selected_profile, "voice", None)
     if enabled and selected_voice is None:
         enabled = False
@@ -385,6 +389,9 @@ def tts_settings_from_tauri_result(
             text_lang=text_lang,
             timeout_seconds=timeout_seconds,
             tone_references=previous.tone_references,
+            use_remote_paths=use_remote_paths,
+            remote_characters_path=remote_characters_path,
+            character_package_dir=getattr(selected_profile, "package_dir", None),
         )
     else:
         settings = GPTSoVITSTTSSettings.from_character_profile(
@@ -400,6 +407,8 @@ def tts_settings_from_tauri_result(
             tts_config_path=tts_config_path,
             onnx_model_dir=onnx_model_dir,
             validate_enabled=False,
+            use_remote_paths=use_remote_paths,
+            remote_characters_path=remote_characters_path,
         )
     return settings
 
@@ -2151,6 +2160,8 @@ def _tts_to_mapping(settings: GPTSoVITSTTSSettings | None, base_dir: Path | None
         "tts_config_path": _path_to_text(current.tts_config_path),
         "provider_defaults": _tts_provider_defaults(base_dir),
         "timeout_seconds": _clamp_int_value(current.timeout_seconds, 1, 600),
+        "use_remote_paths": bool(current.use_remote_paths),
+        "remote_characters_path": current.remote_characters_path,
     }
 
 
@@ -2602,6 +2613,8 @@ def _tts_from_mapping_required(mapping: dict[str, Any]) -> TauriTtsResult:
         python_path=_required_str(mapping, "python_path").strip(),
         tts_config_path=_required_str(mapping, "tts_config_path").strip(),
         timeout_seconds=_clamp_int_value(_required_int(mapping, "timeout_seconds"), 1, 600),
+        use_remote_paths=_required_bool(mapping, "use_remote_paths"),
+        remote_characters_path=_required_str(mapping, "remote_characters_path"),
     )
 
 
@@ -2624,6 +2637,8 @@ def _tts_settings_for_profile(
     work_dir = _optional_path_for_tauri(result_tts.work_dir, base_dir)
     python_path = _optional_path_for_tauri(result_tts.python_path, base_dir)
     tts_config_path = _optional_path_for_tauri(result_tts.tts_config_path, base_dir)
+    use_remote_paths = bool(result_tts.use_remote_paths)
+    remote_characters_path = str(result_tts.remote_characters_path)
     if selected_voice is None or not hasattr(profile, "package_dir"):
         return GPTSoVITSTTSSettings(
             enabled=False,
@@ -2640,6 +2655,9 @@ def _tts_settings_for_profile(
             ref_lang=ref_lang,
             text_lang=text_lang,
             timeout_seconds=result_tts.timeout_seconds,
+            use_remote_paths=use_remote_paths,
+            remote_characters_path=remote_characters_path,
+            character_package_dir=getattr(profile, "package_dir", None),
         )
     return GPTSoVITSTTSSettings.from_character_profile(
         character_profile=profile,
@@ -2654,6 +2672,8 @@ def _tts_settings_for_profile(
         tts_config_path=tts_config_path,
         onnx_model_dir=onnx_model_dir,
         validate_enabled=False,
+        use_remote_paths=use_remote_paths,
+        remote_characters_path=remote_characters_path,
     )
 
 
