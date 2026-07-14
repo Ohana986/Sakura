@@ -1121,6 +1121,7 @@ class TauriSettingsProcess(QObject):
         self.model = model
         self.parent_widget = parent_widget
         self._process: QProcess | None = None
+        self._rpc_response_file = None
         self._nonce = ""
         self._done = False
         self._cleaned = False
@@ -1145,18 +1146,58 @@ class TauriSettingsProcess(QObject):
         process.setProgram(str(binary))
         process.setArguments([])
         process.setWorkingDirectory(str(self.base_dir))
-        process.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
-        process.started.connect(self._handle_started)
-        process.finished.connect(self._handle_finished)
-        process.errorOccurred.connect(self._handle_error)
-        process.readyReadStandardOutput.connect(self._handle_stdout)
 
-        self._process = process
-        self._nonce = str(request["nonce"])
-        self._request_payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
-        self._startup_focus_complete = False
-        process.start()
-        return True
+        rpc_r = None
+        rpc_w = None
+        try:
+            if sys.platform != "win32":
+                # 绕过 std::io::stdin() 的内部 Mutex/BufReader 冲突（改用独立 pipe）
+                _os = __import__("os")
+                rpc_r, rpc_w = _os.pipe()
+                _os.set_inheritable(rpc_r, True)
+                _os.set_inheritable(rpc_w, False)
+                self._rpc_response_file = _os.fdopen(rpc_w, "wb", buffering=0)
+
+                env = QProcessEnvironment.systemEnvironment()
+                env.insert("SAKURA_RPC_RESPONSE_FD", str(rpc_r))
+                process.setProcessEnvironment(env)
+                process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
+            else:
+                self._rpc_response_file = None
+                process.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
+
+            process.started.connect(self._handle_started)
+            process.finished.connect(self._handle_finished)
+            process.errorOccurred.connect(self._handle_error)
+            process.readyReadStandardOutput.connect(self._handle_stdout)
+
+            self._process = process
+            self._nonce = str(request["nonce"])
+            self._request_payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+            self._startup_focus_complete = False
+            process.start()
+            if sys.platform != "win32" and rpc_r is not None:
+                _os.close(rpc_r)  # 父进程不再需要读端，子进程已继承
+                rpc_r = None
+            return True
+        except Exception as exc:
+            if sys.platform != "win32":
+                _os = __import__("os")
+                if rpc_r is not None:
+                    try:
+                        _os.close(rpc_r)
+                    except OSError:
+                        pass
+                if rpc_w is not None:
+                    try:
+                        if self._rpc_response_file is not None:
+                            self._rpc_response_file.close()
+                            self._rpc_response_file = None
+                        else:
+                            _os.close(rpc_w)
+                    except OSError:
+                        pass
+            raise exc
 
     def focus_window(self) -> bool:
         """把已打开的 Tauri 设置窗口还原并前置（用于重复唤起时找回最小化的窗口）。"""
@@ -1626,9 +1667,17 @@ class TauriSettingsProcess(QObject):
             + "\n"
         )
         try:
-            process.write(line.encode("utf-8"))
-        except RuntimeError:
-            return
+            rpc_file = self._rpc_response_file
+            if rpc_file is not None:
+                rpc_file.write(line.encode("utf-8"))
+                rpc_file.flush()
+            else:
+                process.write(line.encode("utf-8"))
+        except (OSError, RuntimeError) as exc:
+            if not self._done:
+                self._done = True
+                self.failed.emit(f"RPC 响应通道写入失败：{exc}")
+                self._cleanup()
 
     def _queue_rpc_response(
         self,
