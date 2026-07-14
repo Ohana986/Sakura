@@ -1235,6 +1235,7 @@ class TauriSettingsProcess(QObject):
         for delay_ms in SETTINGS_FOCUS_RETRY_DELAYS_MS:
             QTimer.singleShot(
                 delay_ms,
+                self,
                 lambda active_process=process: self._try_startup_focus(active_process),
             )
 
