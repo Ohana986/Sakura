@@ -330,7 +330,6 @@ fn read_request_and_spawn_rpc_reader(rpc_response_fd: std::os::unix::io::RawFd) 
     let window_control = WindowControl::default();
     let reader_window_control = window_control.clone();
     std::thread::spawn(move || {
-        // 从独立 pipe fd 读取 RPC 响应，绕过 std::io::stdin() 的全局内部 Mutex。
         let file = unsafe { std::fs::File::from_raw_fd(rpc_response_fd) };
         let mut reader = std::io::BufReader::new(file);
         let mut line = String::new();
@@ -379,7 +378,6 @@ fn read_request_and_spawn_rpc_reader() -> Result<(Value, HostRpc, WindowControl)
     let window_control = WindowControl::default();
     let reader_window_control = window_control.clone();
     std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(std::io::stdin());
         let mut line = String::new();
         loop {
             line.clear();

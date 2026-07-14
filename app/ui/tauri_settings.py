@@ -1151,12 +1151,10 @@ class TauriSettingsProcess(QObject):
         rpc_w = None
         try:
             if sys.platform != "win32":
-                # 绕过 std::io::stdin() 的内部 Mutex/BufReader 冲突（改用独立 pipe）
-                _os = __import__("os")
-                rpc_r, rpc_w = _os.pipe()
-                _os.set_inheritable(rpc_r, True)
-                _os.set_inheritable(rpc_w, False)
-                self._rpc_response_file = _os.fdopen(rpc_w, "wb", buffering=0)
+                rpc_r, rpc_w = os.pipe()
+                os.set_inheritable(rpc_r, True)
+                os.set_inheritable(rpc_w, False)
+                self._rpc_response_file = os.fdopen(rpc_w, "wb", buffering=0)
 
                 env = QProcessEnvironment.systemEnvironment()
                 env.insert("SAKURA_RPC_RESPONSE_FD", str(rpc_r))
@@ -1177,15 +1175,14 @@ class TauriSettingsProcess(QObject):
             self._startup_focus_complete = False
             process.start()
             if sys.platform != "win32" and rpc_r is not None:
-                _os.close(rpc_r)  # 父进程不再需要读端，子进程已继承
+                os.close(rpc_r)
                 rpc_r = None
             return True
         except Exception as exc:
             if sys.platform != "win32":
-                _os = __import__("os")
                 if rpc_r is not None:
                     try:
-                        _os.close(rpc_r)
+                        os.close(rpc_r)
                     except OSError:
                         pass
                 if rpc_w is not None:
@@ -1194,7 +1191,7 @@ class TauriSettingsProcess(QObject):
                             self._rpc_response_file.close()
                             self._rpc_response_file = None
                         else:
-                            _os.close(rpc_w)
+                            os.close(rpc_w)
                     except OSError:
                         pass
             raise exc
